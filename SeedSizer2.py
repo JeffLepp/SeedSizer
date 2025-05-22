@@ -15,7 +15,6 @@ import seaborn as sns
 import pandas as pd
 import numpy as np
 import tifffile
-import openpyxl
 import os
 import gc
 
@@ -31,8 +30,8 @@ def Run(filename):
 
     ### Image Manipulation ###
 
-    path = f"DataOld/{filename}"
-    raw_image = iio.imread(path)                                         # Load File, base case here is Data/Calena-18.tif
+    path = f"Data/{filename}"
+    raw_image = tifffile.memmap(path)                                             # Load File, base case here is Data/Calena-18.tif
     grayscale_image = np.mean(raw_image, axis=2).astype(np.float32)                 # Loads as float32 Grayscale image, which is a decimal number of 0 to 1 for how dark the pixel is
                                                                                     # The seed's are closer to white and the background is closer to black, so we want to find the ideal threshold.
     del raw_image
@@ -48,40 +47,61 @@ def Run(filename):
 
     binary_seed = regionprops_table(labeled_image, properties=["label", "area"])    # Collection of area's of the connected components (collection of adjascent pixels labeled 1, which make up the seed)
     df = pd.DataFrame(binary_seed)                                                  # This turns our dictionary of connected components into a pandas dataframe, where pandas has functions to make this easy
-
     df["area_mm2"] = df["area"] / PP_SQMM                                           # Convert these connected components to mm^2 since we know pixel is 1/1200 of an inch
-    mean_alpha = df ["area_mm2"].mean()                                             # Finding average size of connected components
     median_area = df["area_mm2"].median()
 
-    ### Statistical Analysis ###
-
     df_filtered = df[df["area_mm2"] >= MINSIZE * median_area]                        # Selecting objets smaller than 40% of the median area
-    clumps = df_filtered[df_filtered["area_mm2"] > 1.9 * mean_alpha].copy()
-    clumps["clump_size"] = (clumps["area_mm2"] / mean_alpha).round().astype(int)
+    valid_labels = set(df_filtered["label"])
+    final_mask = np.isin(labeled_image, list(valid_labels))
+    
 
-    size_clumps = clumps["clump_size"].sum()
-    size_singles = len(df_filtered[df_filtered["area_mm2"] <= 1.9 * mean_alpha])
-    total_size = size_clumps + size_singles
+    ### Watershed segmentation ###
 
-    mean_beta = df_filtered[df_filtered["area_mm2"] <= 1.9 * mean_alpha]["area_mm2"].mean()
+    distance = ndi.distance_transform_edt(final_mask)
+    coords = peak_local_max(distance, footprint=np.ones((15, 15)), labels=final_mask)
+
+    markers = np.zeros_like(distance, dtype=int)
+    markers[tuple(coords.T)] = np.arange(len(coords)) + 1
+
+    segmented = watershed(-distance, markers, mask=final_mask)
+    labeled_filtered = label(segmented)
+
+
+    ### Final analysis ###
+
+    props_final = regionprops_table(labeled_filtered, properties=["label", "area"])
+    df_final = pd.DataFrame(props_final)
+    df_final["area_mm2"] = df_final["area"] / PP_SQMM
+
+    final_count = len(df_final)
+    mean_area = df_final["area_mm2"].mean()                                       # Finding average size of connected components
+
 
     ### Output for User ##
     
     print(f"Filepath: {path}")
-    print(f"Total number of filtered seeds: {total_size}")                    # Filtered = all connected components (seeds) of area > .1 mm^2 & is within 80% of data that is closest to mean
-    print(f"Average seed size is: {mean_beta}")
+    print(f"Total number of unfltred seeds: {len(df)}")                             # Unfiltered = all connected components (Seeds) of area > .1 mm^2
+    print(f"Total number of filtered seeds: {final_count}")                    # Filtered = all connected components (seeds) of area > .1 mm^2 & is within 80% of data that is closest to mean
+    print(f"Average seed size is: {mean_area}")
     print()
 
-    return total_size, mean_alpha, mean_beta
+
+    ### Histogram ###
+    
+    sns.histplot(df_final["area_mm2"], bins=50)                                    # Histogram for filtered seeds (basically 1.25 mm^2 - 2.5 mm^2)
+    plt.title("Seed Area Distribution")
+    plt.xlabel("Area (mm^2)")
+    plt.show()
 
 
-def Cycle(folder = "DataOld"):
+    return final_count, mean_area
+
+
+def Cycle(folder = "Data"):
     folder_path = Path(folder)
     tif_files = [file for file in folder_path.glob("*.tif")]
-
-    results = []
 
     for tif_file in tif_files:
         Run(tif_file.name)
 
-Cycle("DataOld")
+Cycle("Data")
