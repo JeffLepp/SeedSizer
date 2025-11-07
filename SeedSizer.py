@@ -20,6 +20,23 @@ import sys
 import os
 import gc
 
+import tkinter as tk
+from tkinter import ttk
+from tkinter import filedialog
+
+from PIL import Image
+Image.MAX_IMAGE_PIXELS = None  # disable Pillow’s decompression bomb limit
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
+import importlib.metadata
+try:
+    importlib.metadata.version("imageio")
+except importlib.metadata.PackageNotFoundError:
+    import imageio
+    imageio.__version__ = "3.0.0"  # dummy fallback for frozen apps
+
+
 PPI = 1200                                                                      # Pixels per inch
 PP_SQMM = (PPI / 25.4) ** 2                                                     # Pixels per square millimeter
 FILTER = 0.1                                                                    # This is basically used saying we won't accept anything < .1 mm^2 in size
@@ -57,10 +74,25 @@ def Run(filename):
 
     ### Image Analysis ###
 
-    binary_seed = regionprops_table(labeled_image, properties=["label", "area"])        # Collection of area's of the connected components (collection of adjascent pixels labeled 1, which make up the seed)
+    binary_seed = regionprops_table(
+        labeled_image,
+        properties=[
+            "label",
+            "area",
+            "eccentricity",
+            "solidity",
+            "major_axis_length",
+            "minor_axis_length",
+        ],
+    )        
+                                                                                        # ^^ Collection of area's of the connected components (collection of adjascent pixels labeled 1, which make up the seed)
     df = pd.DataFrame(binary_seed)                                                      # This turns our dictionary of connected components into a pandas dataframe
 
     df["area_mm2"] = df["area"] / PP_SQMM                                               # Convert these connected components to mm^2 since we know pixel is 1/1200 of an inch
+    df["aspect_ratio"] = df["major_axis_length"] / df["minor_axis_length"]
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df.dropna(inplace=True)
+    
     mean_alpha = df ["area_mm2"].mean()                                                 # Finding average size of connected components
     median_area = df["area_mm2"].median()
 
@@ -77,39 +109,87 @@ def Run(filename):
 
     mean_beta = df_filtered[df_filtered["area_mm2"] <= 1.9 * mean_alpha]["area_mm2"].mean()
 
-    ### Output for User ##
-    
+    mean_ecc = df_filtered["eccentricity"].mean()
+    std_ecc = df_filtered["eccentricity"].std()
+    mean_solidity = df_filtered["solidity"].mean()
+    std_area = df_filtered["area_mm2"].std()
+    var_area = df_filtered["area_mm2"].var()
+    mean_aspect = df_filtered["aspect_ratio"].mean()
+
+    ### Output ###
     print(f"Filepath: {path}")
-    print(f"Total number of filtered seeds: {total_size}")                              
-    print(f"Average seed size is: {mean_beta}")
+    print(f"Total number of filtered seeds: {total_size}")
+    print(f"Average seed size: {mean_beta:.3f} mm²")
+    print(f"Mean eccentricity: {mean_ecc:.3f}")
     print()
 
-    return total_size, mean_beta, median_area, total_size
+    return {
+        "File": path.name,
+        "Seed_Count": total_size,
+        "Mean_Area_mm2": mean_beta,
+        "Median_Area_mm2": median_area,
+        "StdDev_Area_mm2": std_area,
+        "Var_Area_mm2": var_area,
+        "Mean_Eccentricity": mean_ecc,
+        "StdDev_Eccentricity": std_ecc,
+        "Mean_Solidity": mean_solidity,
+        "Mean_Aspect_Ratio": mean_aspect,
+        "Total_Area_mm2": total_area,
+    }
 
 
-def Cycle(folder = "Data"):
-
+def Cycle(folder="Data"):
     folder_path = Path(folder)
-    tif_files = [file for file in folder_path.glob("*.tif")]
-    output_csv = "output.csv"
+    tif_files = list(folder_path.glob("*.tif")) + list(folder_path.glob("*.tiff"))
+    output_csv = Path(folder_path.parent) / f"{folder_path.name}_data.csv"
 
-    results = []
+    # --- Create small progress window ---
+    progress_win = tk.Toplevel()
+    progress_win.title("SeedSizer Progress")
+    progress_win.geometry("400x120")
+    progress_win.resizable(False, False)
 
-    for tif_file in tif_files:
-        total_size, mean_beta, median_area, total_size = Run(tif_file.name)
+    label_status = tk.Label(progress_win, text="Processing TIFF images...", font=("Segoe UI", 11))
+    label_status.pack(pady=10)
 
-        results.append({
-            "Total Size": total_size,
-            "Mean Size": mean_beta,
-            "Median Area": median_area,
-            "File": tif_file.name
-        })
+    label_file = tk.Label(progress_win, text="", font=("Segoe UI", 9))
+    label_file.pack()
 
-    df_results = pd.DataFrame(results)
-    df_results.to_csv(output_csv, index=False)
+    progress_bar = ttk.Progressbar(progress_win, length=320, mode="determinate")
+    progress_bar.pack(pady=10)
+    progress_bar["maximum"] = len(tif_files)
+
+    progress_win.update()
+
+    result = []
+    for i, tif_file in enumerate(tif_files):
+
+        label_file.config(text=f"→ {tif_file.name}")
+        progress_bar["value"] = i - 1
+        progress_win.update()
+
+        stats = Run(tif_file)
+
+        df_row = pd.DataFrame([stats])  # single-row DataFrame
+        file_exists = output_csv.exists()
+
+        # Append one line without rewriting the whole file
+        df_row.to_csv(output_csv, mode="a", header=not file_exists, index=False)
+        print(f"Added {tif_file.name} to {output_csv.name}", flush=True)
+
+    progress_bar["value"] = len(tif_files)
+    label_status.config(text=f"Complete — saved to {output_csv.name}")
+    label_file.config(text="")
+    progress_win.update()
 
 
 if __name__ == "__main__":
-    import sys
-    folder = sys.argv[1] if len(sys.argv) > 1 else "."
+    root = tk.Tk()
+    root.withdraw()  # hide main window
+    folder = filedialog.askdirectory(title="Select folder containing .TIFF images")
+
+    if not folder:
+        print("No folder selected. Exiting.")
+        sys.exit(0)
+
     Cycle(folder)
