@@ -39,11 +39,11 @@ except importlib.metadata.PackageNotFoundError:
 
 PPI = 1200                                                                      # Pixels per inch
 PP_SQMM = (PPI / 25.4) ** 2                                                     # Pixels per square millimeter
+PX_PER_MM = PPI / 25.4                                                          # pixels per millimeter
 FILTER = 0.1                                                                    # This is basically used saying we won't accept anything < .1 mm^2 in size
 MINSIZE = .5                                                                    # This is the minimum size of a seed we want to consider, in this case 50% of the median area   
 
 #################################################################################################################################################################################################
-# I see you're digging around, if you want help contact for assistance: jefferson.kline@wsu.edu
 #
 # Though to make this more user friendly, I made adjustable parameters above to match your image requirements. 
 #
@@ -99,45 +99,54 @@ def Run(filename):
     ### Statistical Analysis ###
 
     df_filtered = df[df["area_mm2"] >= MINSIZE * median_area]                           # Selecting objets larger than 40% of the median area
-    clumps = df_filtered[df_filtered["area_mm2"] > 1.9 * mean_alpha].copy()
-    clumps["clump_size"] = (clumps["area_mm2"] / mean_alpha).round().astype(int)
+    clumps = df_filtered[df_filtered["area_mm2"] > 1.9 * mean_alpha].copy()             # Selecting objects larger than 1.9 times the mean area (these are likely clumps of seeds)
+    clumps["clump_size"] = (clumps["area_mm2"] / mean_alpha).round().astype(int)        # Estimating number of seeds in each clump
 
-    size_clumps = clumps["clump_size"].sum()
-    size_singles = len(df_filtered[df_filtered["area_mm2"] <= 1.9 * mean_alpha])
-    total_size = size_clumps + size_singles
+    size_clumps = clumps["clump_size"].sum()                                            # Counting number of seeds in clumps
+    size_singles = len(df_filtered[df_filtered["area_mm2"] <= 1.9 * mean_alpha])        # Counting number of single seeds (not in clumps)
+    total_size = size_clumps + size_singles                                             # Aggregate seed count                                      
     total_area = df_filtered["area_mm2"].sum()
 
-    mean_beta = df_filtered[df_filtered["area_mm2"] <= 1.9 * mean_alpha]["area_mm2"].mean()
+    mean_beta = df_filtered[df_filtered["area_mm2"] <= 1.9 * mean_alpha]["area_mm2"].mean() 
 
-    mean_ecc = df_filtered["eccentricity"].mean()
-    std_ecc = df_filtered["eccentricity"].std()
-    mean_solidity = df_filtered["solidity"].mean()
-    std_area = df_filtered["area_mm2"].std()
-    var_area = df_filtered["area_mm2"].var()
-    mean_aspect = df_filtered["aspect_ratio"].mean()
+    length_mm = df_filtered["major_axis_length"] / PX_PER_MM
+    width_mm  = df_filtered["minor_axis_length"] / PX_PER_MM
+
+    # --- Requested stats / column names ---
+    area_mean = df_filtered["area_mm2"].mean()
+    area_std  = df_filtered["area_mm2"].std()
+
+    len_mean  = length_mm.mean()
+    len_std   = length_mm.std()
+
+    wid_mean  = width_mm.mean()
+    wid_std   = width_mm.std()
+
+    ecc_mean  = df_filtered["eccentricity"].mean()
+    ecc_std   = df_filtered["eccentricity"].std()
 
     ### Output ###
     print(f"Filepath: {path}")
     print(f"Total number of filtered seeds: {total_size}")
     print(f"Average seed size: {mean_beta:.3f} mm²")
-    print(f"Mean eccentricity: {mean_ecc:.3f}")
     print()
 
     return {
-        "File": path.name,
-        "Seed_Count": total_size,
-        "Mean_Area_mm2": mean_beta,
-        "Median_Area_mm2": median_area,
-        "StdDev_Area_mm2": std_area,
-        "Var_Area_mm2": var_area,
-        "Mean_Eccentricity": mean_ecc,
-        "StdDev_Eccentricity": std_ecc,
-        "Mean_Solidity": mean_solidity,
-        "Mean_Aspect_Ratio": mean_aspect,
-        "Total_Area_mm2": total_area,
+        "fileName": path.name,
+        "objectNumber": "",             # per-image summary => leave blank; see note below
+        "Area": float(area_mean),       # mean area (mm^2)
+        "StdArea": float(area_std),     # std dev of area (mm^2)
+        "Length": float(len_mean),      # mean major axis (mm)
+        "StdLength": float(len_std),    # std dev major axis (mm)
+        "Width": float(wid_mean),       # mean minor axis (mm)
+        "StdWidth": float(wid_std),     # std dev minor axis (mm)
+        "Eccentricity": float(ecc_mean),# mean eccentricity (0-1) - correlates to degree of roundness vs oval
+        "StdEccentricity": float(ecc_std),
+        "sscount": int(total_size),     # clump-aware seed count
+        "AvgSizeOfOneSeed": int(mean_beta),
     }
 
-
+# This is where we cycle through each image in the folder that was passed by the user
 def Cycle(folder="Data"):
     folder_path = Path(folder)
     tif_files = list(folder_path.glob("*.tif")) + list(folder_path.glob("*.tiff"))
@@ -170,10 +179,10 @@ def Cycle(folder="Data"):
 
         stats = Run(tif_file)
 
-        df_row = pd.DataFrame([stats])  # single-row DataFrame
+        df_row = pd.DataFrame([stats]) 
         file_exists = output_csv.exists()
 
-        # Append one line without rewriting the whole file
+        # append cycle data to output CSV
         df_row.to_csv(output_csv, mode="a", header=not file_exists, index=False)
         print(f"Added {tif_file.name} to {output_csv.name}", flush=True)
 
@@ -182,6 +191,11 @@ def Cycle(folder="Data"):
     label_file.config(text="")
     progress_win.update()
 
+
+# Run SeedSizer.py as a standalone program
+# You can also convert to a .exe using pyinstaller and run on any device without Python installed
+
+# Note folder query may take a few seconds due to filedialog performance on some systems
 
 if __name__ == "__main__":
     root = tk.Tk()
