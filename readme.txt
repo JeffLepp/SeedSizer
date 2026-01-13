@@ -1,3 +1,4 @@
+Designed For Vogel Plant Pathology Wheat Health and Genetics Research Unit. 
 
 This program was designed to analyze .tif flatbed scans of caminilla seeds behind a black surface, 
 if you're images differ from this there may be unexpected results, but should work if:
