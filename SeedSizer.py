@@ -3,7 +3,7 @@ from skimage.filters        import threshold_otsu
 from skimage.measure        import label, regionprops
 from skimage.transform      import rescale
 from skimage.measure        import regionprops_table
-from skimage.morphology     import binary_opening, disk, remove_small_holes, remove_small_objects
+from skimage.morphology     import remove_small_objects
 from pathlib                import Path
 from scipy                  import ndimage as ndi
 from skimage.feature        import peak_local_max
@@ -43,7 +43,6 @@ PX_PER_MM = PPI / 25.4                                                          
 FILTER = 0.1                                                                    # This is basically used saying we won't accept anything < .1 mm^2 in size
 MINSIZE = .5                                                                    # This is the minimum size of a seed we want to consider, in this case 50% of the median area   
 
-BACKGROUND_SIGMA_MM = 6.0                                                       # Removes broad lighting bands before thresholding
 MIN_SEED_AREA_MM2 = 0.12                                                        # Absolute lower bound; keeps dust from defining "median seed"
 MIN_REFERENCE_SEED_AREA_MM2 = 0.20                                              # Floor used for clump estimates when scans are noisy
 MAX_SINGLE_SEED_AREA_MM2 = 6.0
@@ -65,63 +64,11 @@ CLUMP_FACTOR = 1.9
 #################################################################################################################################################################################################
 
 
-def _as_float_rgb(raw_image):
+def _as_grayscale_float(raw_image):
     if raw_image.ndim == 2:
-        raw_image = np.stack([raw_image, raw_image, raw_image], axis=2)
-    elif raw_image.shape[2] > 3:
-        raw_image = raw_image[:, :, :3]
+        return raw_image.astype(np.float32)
 
-    image = raw_image.astype(np.float32, copy=False)
-    if np.issubdtype(raw_image.dtype, np.integer):
-        dtype_max = np.iinfo(raw_image.dtype).max
-        image = image / dtype_max
-    elif image.max() > 1.0:
-        image = image / 255.0
-
-    return np.clip(image, 0.0, 1.0)
-
-
-def _normalize_channel(channel):
-    lo, hi = np.percentile(channel, (1, 99))
-    spread = hi - lo
-    if spread <= 1e-6:
-        return np.zeros_like(channel, dtype=np.float32)
-    return np.clip((channel - lo) / spread, 0.0, 1.0).astype(np.float32)
-
-
-def _build_seed_mask(rgb_image):
-    red = rgb_image[:, :, 0]
-    green = rgb_image[:, :, 1]
-    blue = rgb_image[:, :, 2]
-    grayscale_image = np.mean(rgb_image, axis=2).astype(np.float32)
-
-    sigma_px = max(2.0, BACKGROUND_SIGMA_MM * PX_PER_MM)
-    background = ndi.gaussian_filter(grayscale_image, sigma=sigma_px)
-    local_contrast = grayscale_image - background
-
-    red_excess = red - np.maximum(green, blue)
-    saturation = np.max(rgb_image, axis=2) - np.min(rgb_image, axis=2)
-
-    seed_score = (
-        0.60 * _normalize_channel(local_contrast)
-        + 0.25 * _normalize_channel(red_excess)
-        + 0.15 * _normalize_channel(saturation)
-    )
-
-    try:
-        threshold_value = threshold_otsu(seed_score)
-    except ValueError:
-        threshold_value = np.percentile(seed_score, 99)
-
-    binary_image = seed_score > threshold_value
-    binary_image = remove_small_objects(binary_image, min_size=int(PP_SQMM * FILTER))
-    binary_image = remove_small_holes(binary_image, area_threshold=int(PP_SQMM * 0.03))
-
-    opening_radius = max(1, int(PX_PER_MM * 0.025))
-    binary_image = binary_opening(binary_image, footprint=disk(opening_radius))
-    binary_image = remove_small_objects(binary_image, min_size=int(PP_SQMM * MIN_SEED_AREA_MM2))
-
-    return binary_image, seed_score, grayscale_image
+    return np.mean(raw_image[:, :, :3], axis=2).astype(np.float32)
 
 
 def _quality_note(parts):
@@ -164,11 +111,13 @@ def Run(filename):
 
     path = Path(filename).resolve()
     raw_image = iio.imread(path)
-    rgb_image = _as_float_rgb(raw_image)
+    grayscale_image = _as_grayscale_float(raw_image)
     del raw_image
     gc.collect() 
 
-    binary_clean, seed_score, grayscale_image = _build_seed_mask(rgb_image)
+    threshold_value = threshold_otsu(grayscale_image)
+    binary_image = grayscale_image > threshold_value
+    binary_clean = remove_small_objects(binary_image, min_size=int(PP_SQMM * FILTER))
     labeled_image = label(binary_clean)
 
 
@@ -176,16 +125,13 @@ def Run(filename):
 
     binary_seed = regionprops_table(
         labeled_image,
-        intensity_image=seed_score,
         properties=[
             "label",
             "area",
-            "bbox",
             "eccentricity",
             "solidity",
             "major_axis_length",
             "minor_axis_length",
-            "mean_intensity",
         ],
     )        
                                                                                         # ^^ Collection of area's of the connected components (collection of adjascent pixels labeled 1, which make up the seed)
@@ -193,7 +139,7 @@ def Run(filename):
     raw_object_count = len(df)
 
     if df.empty:
-        return _empty_result(path, "No seed-like objects found after robust thresholding.", raw_object_count, 0)
+        return _empty_result(path, "No seed-like objects found after thresholding.", raw_object_count, 0)
 
     df["area_mm2"] = df["area"] / PP_SQMM                                               # Convert these connected components to mm^2 since we know pixel is 1/1200 of an inch
     df["aspect_ratio"] = df["major_axis_length"] / df["minor_axis_length"]
