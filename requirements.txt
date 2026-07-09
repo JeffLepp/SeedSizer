@@ -1,16 +1,29 @@
+# SeedSizer runtime dependencies
+#
+# Install with:
+#   python -m pip install -r requirements.txt
+#
+# tkinter is also used by SeedSizer.py for the folder picker/progress window.
+# It ships with most Python installers on Windows and macOS. On some Linux
+# systems it must be installed with the OS package manager, for example:
+#   sudo apt install python3-tk
+
 numpy>=1.24
 pandas>=2.0
 scipy>=1.10
+scikit-image>=0.22
 
+# TIFF/image reading support
+imageio>=2.31
+tifffile>=2023.7
+imagecodecs>=2023.1
+Pillow>=9.5
+
+# Imported by SeedSizer.py. Keep these installed unless the matching imports
+# are removed from the script.
 matplotlib>=3.7
 seaborn>=0.12
-
-scikit-image>=0.22
-imageio[ffmpeg]>=2.31
-imagecodecs>=2023.1
-tifffile>=2023.7
-Pillow>=9.5.0
-
 openpyxl>=3.1
 
+# Optional: needed only by maintainers building a Windows .exe.
 pyinstaller>=6.0
