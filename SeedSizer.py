@@ -52,6 +52,9 @@ MAX_CLUMP_ASPECT_RATIO = 9.0
 MIN_SOLIDITY = 0.45
 CLUMP_FACTOR = 1.9
 
+DEGENERATE_FG = 0.15                                                            # >15% of the bed being seed is physically impossible for one layer
+FALLBACK_THRESHOLD = 62.0                                                       # sits in the empty gap between background (~30) and seed (70-135)
+
 #################################################################################################################################################################################################
 #
 # Though to make this more user friendly, I made adjustable parameters above to match your image requirements. 
@@ -105,6 +108,12 @@ def _empty_result(path, processing_note, raw_object_count, rejected_object_count
     }
 
 
+def _degenerate_prefix(was_degenerate):
+    """Keep the fallback visible on the early-exit paths too, so a scan is never
+    silently rescued without it showing up in the output."""
+    return f"Otsu was degenerate; used fixed threshold {FALLBACK_THRESHOLD:.0f}. " if was_degenerate else ""
+
+
 def Run(filename):
 
     ### Image Manipulation ###
@@ -116,6 +125,18 @@ def Run(filename):
     gc.collect() 
 
     threshold_value = threshold_otsu(grayscale_image)
+
+    # Otsu splits a histogram into two modes. A nearly empty scan only has one -
+    # the background - so Otsu splits background noise instead and calls half the
+    # bed "seed"; the clump divider then turns that single blob into tens of
+    # thousands of phantom seeds (Pot_208: 12 real seeds reported as 154,147).
+    # No seed layer can cover 15% of the bed, so treat that as the tell and cut
+    # in the empty gap between background and seed instead. Verified to leave
+    # healthy scans bit-for-bit unchanged.
+    otsu_degenerate = float((grayscale_image > threshold_value).mean()) > DEGENERATE_FG
+    if otsu_degenerate:
+        threshold_value = FALLBACK_THRESHOLD
+
     binary_image = grayscale_image > threshold_value
     binary_clean = remove_small_objects(binary_image, min_size=int(PP_SQMM * FILTER))
     labeled_image = label(binary_clean)
@@ -139,7 +160,8 @@ def Run(filename):
     raw_object_count = len(df)
 
     if df.empty:
-        return _empty_result(path, "No seed-like objects found after thresholding.", raw_object_count, 0)
+        return _empty_result(path, _degenerate_prefix(otsu_degenerate)
+                             + "No seed-like objects found after thresholding.", raw_object_count, 0)
 
     df["area_mm2"] = df["area"] / PP_SQMM                                               # Convert these connected components to mm^2 since we know pixel is 1/1200 of an inch
     df["aspect_ratio"] = df["major_axis_length"] / df["minor_axis_length"]
@@ -148,7 +170,8 @@ def Run(filename):
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.dropna(inplace=True)
     if df.empty:
-        return _empty_result(path, "All detected objects had invalid shape measurements.", raw_object_count)
+        return _empty_result(path, _degenerate_prefix(otsu_degenerate)
+                             + "All detected objects had invalid shape measurements.", raw_object_count)
 
     ### Statistical Analysis ###
 
@@ -188,6 +211,11 @@ def Run(filename):
     single_seed_areas = df_filtered[df_filtered["area_mm2"] <= CLUMP_FACTOR * reference_seed_area]["area_mm2"]
     mean_beta = single_seed_areas.mean()
     quality_notes = []
+    if otsu_degenerate:
+        quality_notes.append(
+            f"Otsu was degenerate (>{DEGENERATE_FG:.0%} foreground); used fixed "
+            f"threshold {FALLBACK_THRESHOLD:.0f}. Scan is nearly empty - verify against weight."
+        )
     if pd.isna(mean_beta):
         if df_filtered.empty:
             quality_notes.append("No filtered seed objects found; average single seed size unavailable.")

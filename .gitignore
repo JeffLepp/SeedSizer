@@ -9,3 +9,7 @@
 __pycache__/
 SixScan_Previews/
 *_flagged.xlsx
+
+# synthetic test scans are regenerable from synth_test.py; only the truth travels
+SynthScans/*.png
+SynthScans/*.log
