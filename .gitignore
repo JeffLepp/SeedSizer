@@ -4,3 +4,8 @@
 *.exe
 *.pkg
 *.spec
+
+# analysis output
+__pycache__/
+SixScan_Previews/
+*_flagged.xlsx
