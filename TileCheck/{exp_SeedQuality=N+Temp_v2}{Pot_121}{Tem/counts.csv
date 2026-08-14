@@ -1,0 +1,5 @@
+tile,bin,row,col,seedsizer_count,objects,clumps,my_count
+tile_000_sparse_pred50,sparse,1,1,50,49,1,51
+tile_001_sparse_pred53,sparse,0,1,53,51,2,54
+tile_002_sparse_pred57,sparse,0,2,57,56,1,58
+tile_003_sparse_pred65,sparse,1,0,65,63,2,67

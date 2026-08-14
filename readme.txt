@@ -12,14 +12,14 @@ if you're images differ from this there may be unexpected results, but should wo
 
 1: Install dependencies with command in console:
 
-    'pip install -r requirements.txt'
+    'python3 -m pip install -r requirements.txt'
 
     NOTE: if this fails open requirements.txt and install each manually with:
 
         'pip install <DEPENDENCY>', 
         do not include the version number with this: numpy>=1.24 would be 'pip install numpy'
 
-2: Navigate to SEEDSIZE directory in console and run 'python SeedSizer.py'
+2: Navigate to SEEDSIZE directory in console and run 'python3 SeedSizer.py'
 
 3: Select the folder containing batch of .tiff file images
 

@@ -1,0 +1,9 @@
+tile,bin,row,col,seedsizer_count,objects,clumps,my_count
+tile_000_empty_pred0,empty,0,0,0,0,0,
+tile_001_empty_pred0,empty,0,1,0,0,0,
+tile_002_empty_pred0,empty,0,2,0,0,0,
+tile_003_empty_pred0,empty,0,3,0,0,0,
+tile_004_verysparse_pred2,very sparse,2,2,2,2,0,
+tile_005_verysparse_pred2,very sparse,3,2,2,2,0,
+tile_006_verysparse_pred2,very sparse,4,2,2,2,0,
+tile_007_verysparse_pred3,very sparse,2,1,3,3,0,
