@@ -275,35 +275,67 @@ def Run(filename):
     }
 
 # This is where we cycle through each image in the folder that was passed by the user
-def Cycle(folder="Data"):
+def _find_tif_files(folder_path):
+    return sorted(
+        path for path in folder_path.iterdir()
+        if path.is_file() and path.suffix.lower() in {".tif", ".tiff"}
+    )
+
+
+def _create_progress_window(total_files, root=None):
+    try:
+        if root is None:
+            root = tk.Tk()
+            root.withdraw()
+
+        progress_win = tk.Toplevel(root)
+        progress_win.title("SeedSizer Progress")
+        progress_win.geometry("400x120")
+        progress_win.resizable(False, False)
+
+        label_status = tk.Label(progress_win, text="Processing TIFF images...", font=("Segoe UI", 11))
+        label_status.pack(pady=10)
+
+        label_file = tk.Label(progress_win, text="", font=("Segoe UI", 9))
+        label_file.pack()
+
+        progress_bar = ttk.Progressbar(progress_win, length=320, mode="determinate")
+        progress_bar.pack(pady=10)
+        progress_bar["maximum"] = total_files
+
+        progress_win.update()
+        return progress_win, label_status, label_file, progress_bar
+    except tk.TclError as exc:
+        print(f"Progress window unavailable ({exc}); continuing in console.", flush=True)
+        return None
+
+
+def Cycle(folder="Data", root=None):
     folder_path = Path(folder)
-    tif_files = list(folder_path.glob("*.tif")) + list(folder_path.glob("*.tiff"))
+    if not folder_path.is_dir():
+        print(f"Selected folder does not exist: {folder_path}")
+        return
+
+    tif_files = _find_tif_files(folder_path)
     output_csv = Path(folder_path.parent) / f"{folder_path.name}_data.csv"
 
-    # --- Create small progress window ---
-    progress_win = tk.Toplevel()
-    progress_win.title("SeedSizer Progress")
-    progress_win.geometry("400x120")
-    progress_win.resizable(False, False)
-
-    label_status = tk.Label(progress_win, text="Processing TIFF images...", font=("Segoe UI", 11))
-    label_status.pack(pady=10)
-
-    label_file = tk.Label(progress_win, text="", font=("Segoe UI", 9))
-    label_file.pack()
-
-    progress_bar = ttk.Progressbar(progress_win, length=320, mode="determinate")
-    progress_bar.pack(pady=10)
-    progress_bar["maximum"] = len(tif_files)
-
-    progress_win.update()
+    progress = _create_progress_window(len(tif_files), root)
+    if not tif_files:
+        print(f"No .tif or .tiff files found in {folder_path}")
+        if progress:
+            progress_win, label_status, label_file, progress_bar = progress
+            label_status.config(text="No TIFF images found")
+            progress_win.update()
+        return
 
     result = []
     for i, tif_file in enumerate(tif_files):
 
-        label_file.config(text=f"→ {tif_file.name}")
-        progress_bar["value"] = i
-        progress_win.update()
+        if progress:
+            progress_win, label_status, label_file, progress_bar = progress
+            label_file.config(text=f"Processing {tif_file.name}")
+            progress_bar["value"] = i
+            progress_win.update()
 
         stats = Run(tif_file)
 
@@ -314,10 +346,12 @@ def Cycle(folder="Data"):
         df_row.to_csv(output_csv, mode="a", header=not file_exists, index=False)
         print(f"Added {tif_file.name} to {output_csv.name}", flush=True)
 
-    progress_bar["value"] = len(tif_files)
-    label_status.config(text=f"Complete — saved to {output_csv.name}")
-    label_file.config(text="")
-    progress_win.update()
+    if progress:
+        progress_win, label_status, label_file, progress_bar = progress
+        progress_bar["value"] = len(tif_files)
+        label_status.config(text=f"Complete - saved to {output_csv.name}")
+        label_file.config(text="")
+        progress_win.update()
 
 
 # Run SeedSizer.py as a standalone program
@@ -326,12 +360,21 @@ def Cycle(folder="Data"):
 # Note folder query may take a few seconds due to filedialog performance on some systems
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    root.withdraw()  # hide main window
-    folder = filedialog.askdirectory(title="Select folder containing .TIFF images")
+    root = None
+    if len(sys.argv) > 1:
+        folder = sys.argv[1]
+    else:
+        try:
+            root = tk.Tk()
+            root.withdraw()  # hide main window
+            folder = filedialog.askdirectory(title="Select folder containing .TIFF images")
+        except tk.TclError as exc:
+            print(f"Could not open folder picker ({exc}).")
+            print("Run with a folder path instead, for example: python3 SeedSizer.py /path/to/scans")
+            sys.exit(1)
 
     if not folder:
         print("No folder selected. Exiting.")
         sys.exit(0)
 
-    Cycle(folder)
+    Cycle(folder, root)

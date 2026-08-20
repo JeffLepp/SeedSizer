@@ -1,0 +1,10 @@
+file,preset,bed,n_seeds,n_touching,n_dust,mean_area_mm2,total_area_mm2,overlap_pct,fill_pct
+healthy_0.png,healthy,10200x14040,900,0,800,1.5115,1360.339,0.03,2.119
+touching_0.png,touching,10200x14040,900,540,800,1.5161,1364.48,0.12,2.124
+heavy_clump_0.png,heavy_clump,10200x14040,900,855,800,1.5357,1382.099,0.2,2.15
+sparse_0.png,sparse,10200x14040,12,0,300,0.776,9.312,0.04,0.015
+sparse_clump_0.png,sparse_clump,10200x14040,40,28,300,0.9375,37.501,0.33,0.058
+field_0.png,field,10200x14040,1150,459,4000,1.5074,1733.478,0.09,2.699
+banded_0.png,banded,10200x14040,600,180,800,1.5111,906.641,0.08,1.412
+shrivelled_0.png,shrivelled,10200x14040,900,360,800,0.811,729.876,0.16,1.136
+dense_dark_0.png,dense_dark,10200x14040,1200,600,800,1.524,1828.805,0.1,2.847
