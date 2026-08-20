@@ -9,6 +9,9 @@
 __pycache__/
 SixScan_Previews/
 *_flagged.xlsx
+*.xlsx
+*.csv
+!SynthScans/truth.csv
 
 # synthetic test scans are regenerable from synth_test.py; only the truth travels
 SynthScans/*.png
@@ -17,3 +20,4 @@ SynthScans/*.log
 # tile images are regenerable from tiles.py; the hand counts are not, so they stay
 TileCheck/**/*.png
 TileCheck/**/index.html
+!TileCheck/**/counts.csv
