@@ -5,6 +5,7 @@ SeedSizer pipeline over them.
     python synth_test.py screen [tol] [only]    score threshold candidates
     python synth_test.py batch [n] [bed] [keep]  n randomised scans, truth vs measured
     python synth_test.py verify [real_dir]      compare synthetic stats to real scans
+    python synth_test.py gui                    interactive synthetic scan producer
     python synth_test.py demo                   self-check (fast)
 
 WHY THIS EXISTS
@@ -28,7 +29,7 @@ roughly 1.2 GB of RAM and produces ~80 MB per PNG (about 700 MB for a full set).
 minute each, so a full sweep is hours, not minutes. `demo` uses a small bed and
 takes seconds.
 """
-import io, os, sys, csv, glob, contextlib
+import io, os, sys, csv, glob, contextlib, threading, time, traceback
 import numpy as np
 from PIL import Image
 
@@ -629,6 +630,374 @@ def batch_report(rows):
           f"worst under {rat.min():.2f}x")
 
 
+# ---------------------------------------------------------------------- GUI
+
+def _gui_seed_gray(brightness):
+    """Map a user-facing visibility slider to the generator's gray range."""
+    brightness = float(np.clip(brightness, 0, 100))
+    lo = 42.0 + 0.48 * brightness
+    hi = min(155.0, lo + 18.0 + 0.22 * brightness)
+    return lo, hi
+
+
+def _gui_brightness_from_gray(gray):
+    return int(np.clip(round((float(gray[0]) - 42.0) / 0.48), 0, 100))
+
+
+def _gui_write_truth(row):
+    os.makedirs(OUT, exist_ok=True)
+    path = os.path.join(OUT, "gui_truth.csv")
+    cols = [
+        "file", "preset", "bed", "n_seeds", "requested_seeds", "n_touching",
+        "touching_pct", "n_dust", "seed_brightness", "seed_scale", "band_amp",
+        "max_cluster_size", "mean_area_mm2", "total_area_mm2", "overlap_pct",
+        "fill_pct", "measured_count", "count_error_pct", "processing_note",
+    ]
+    exists = os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        w = csv.DictWriter(f, cols)
+        if not exists:
+            w.writeheader()
+        w.writerow({c: row.get(c, "") for c in cols})
+
+
+def gui():
+    """Interactive front-end for producing and checking synthetic seed scans."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog, messagebox, ttk
+        from PIL import ImageTk
+    except Exception as exc:
+        sys.exit(f"Could not open the synthetic data GUI: {exc}")
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        sys.exit(f"Could not open the synthetic data GUI: {exc}")
+    root.title("Synthetic Seed Scan Producer")
+    root.geometry("1120x760")
+    root.minsize(980, 650)
+
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")
+    except tk.TclError:
+        pass
+
+    main = ttk.Frame(root, padding=12)
+    main.pack(fill="both", expand=True)
+    main.columnconfigure(1, weight=1)
+    main.rowconfigure(0, weight=1)
+
+    controls = ttk.Frame(main, width=340)
+    controls.grid(row=0, column=0, sticky="nsw", padx=(0, 12))
+    controls.columnconfigure(1, weight=1)
+
+    preview = ttk.Frame(main)
+    preview.grid(row=0, column=1, sticky="nsew")
+    preview.columnconfigure(0, weight=1)
+    preview.rowconfigure(0, weight=1)
+
+    preset_var = tk.StringVar(value="custom")
+    seed_var = tk.IntVar(value=120)
+    touch_var = tk.DoubleVar(value=35)
+    cluster_var = tk.IntVar(value=8)
+    bright_var = tk.DoubleVar(value=70)
+    scale_var = tk.DoubleVar(value=1.0)
+    dust_var = tk.IntVar(value=160)
+    band_var = tk.DoubleVar(value=2.5)
+    random_var = tk.IntVar(value=7)
+    bed_mode_var = tk.StringVar(value="Preview square")
+    bed_size_var = tk.IntVar(value=3200)
+    last = {"img": None, "truth": None, "photo": None, "path": None}
+
+    busy_widgets = []
+
+    def add_labeled(row, text, widget):
+        ttk.Label(controls, text=text).grid(row=row, column=0, sticky="w", pady=4)
+        widget.grid(row=row, column=1, sticky="ew", pady=4)
+        busy_widgets.append(widget)
+
+    row = 0
+    add_labeled(row, "Preset", ttk.Combobox(
+        controls, textvariable=preset_var, values=["custom"] + sorted(PRESETS),
+        state="readonly"))
+    preset_box = busy_widgets[-1]
+
+    row += 1
+    add_labeled(row, "Number of seeds", tk.Spinbox(
+        controls, from_=1, to=5000, increment=1, textvariable=seed_var, width=10))
+
+    row += 1
+    add_labeled(row, "Touching/clumped (%)", ttk.Scale(
+        controls, from_=0, to=100, variable=touch_var, orient="horizontal"))
+    touch_label = ttk.Label(controls, text="")
+    touch_label.grid(row=row, column=2, sticky="e", padx=(6, 0))
+
+    row += 1
+    add_labeled(row, "Max cluster size", tk.Spinbox(
+        controls, from_=2, to=60, increment=1, textvariable=cluster_var, width=10))
+
+    row += 1
+    add_labeled(row, "Seed brightness", ttk.Scale(
+        controls, from_=0, to=100, variable=bright_var, orient="horizontal"))
+    bright_label = ttk.Label(controls, text="")
+    bright_label.grid(row=row, column=2, sticky="e", padx=(6, 0))
+
+    row += 1
+    add_labeled(row, "Seed size scale", tk.Spinbox(
+        controls, from_=0.35, to=1.6, increment=0.05, textvariable=scale_var, width=10))
+
+    row += 1
+    add_labeled(row, "Dust/chaff objects", tk.Spinbox(
+        controls, from_=0, to=10000, increment=10, textvariable=dust_var, width=10))
+
+    row += 1
+    add_labeled(row, "Scanner banding", tk.Spinbox(
+        controls, from_=0.0, to=8.0, increment=0.25, textvariable=band_var, width=10))
+
+    row += 1
+    add_labeled(row, "Random seed", tk.Spinbox(
+        controls, from_=0, to=999999, increment=1, textvariable=random_var, width=10))
+
+    row += 1
+    add_labeled(row, "Bed mode", ttk.Combobox(
+        controls, textvariable=bed_mode_var, values=["Preview square", "Full A4 scan"],
+        state="readonly"))
+
+    row += 1
+    add_labeled(row, "Preview bed pixels", tk.Spinbox(
+        controls, from_=1000, to=7000, increment=250, textvariable=bed_size_var, width=10))
+
+    row += 1
+    button_frame = ttk.Frame(controls)
+    button_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(12, 6))
+    button_frame.columnconfigure((0, 1), weight=1)
+
+    generate_button = ttk.Button(button_frame, text="Generate Preview")
+    save_button = ttk.Button(button_frame, text="Save PNG")
+    analyze_button = ttk.Button(button_frame, text="Save + Run SeedSizer")
+    choose_button = ttk.Button(button_frame, text="Save As...")
+    generate_button.grid(row=0, column=0, sticky="ew", padx=(0, 4), pady=3)
+    save_button.grid(row=0, column=1, sticky="ew", padx=(4, 0), pady=3)
+    analyze_button.grid(row=1, column=0, columnspan=2, sticky="ew", pady=3)
+    choose_button.grid(row=2, column=0, columnspan=2, sticky="ew", pady=3)
+    busy_widgets.extend([generate_button, save_button, analyze_button, choose_button])
+
+    row += 1
+    status_var = tk.StringVar(value="Ready")
+    ttk.Label(controls, textvariable=status_var, wraplength=330).grid(
+        row=row, column=0, columnspan=3, sticky="ew", pady=(8, 4))
+
+    row += 1
+    results = tk.Text(controls, height=14, width=40, wrap="word", state="disabled")
+    results.grid(row=row, column=0, columnspan=3, sticky="nsew", pady=(4, 0))
+    controls.rowconfigure(row, weight=1)
+
+    image_label = ttk.Label(preview, anchor="center")
+    image_label.grid(row=0, column=0, sticky="nsew")
+
+    def update_slider_labels(*_):
+        touch_label.config(text=f"{int(touch_var.get())}%")
+        lo, hi = _gui_seed_gray(bright_var.get())
+        bright_label.config(text=f"{int(lo)}-{int(hi)}")
+
+    for var in (touch_var, bright_var):
+        var.trace_add("write", update_slider_labels)
+    update_slider_labels()
+
+    def set_results(text):
+        results.config(state="normal")
+        results.delete("1.0", tk.END)
+        results.insert("1.0", text)
+        results.config(state="disabled")
+
+    def set_busy(is_busy):
+        state = tk.DISABLED if is_busy else tk.NORMAL
+        for widget in busy_widgets:
+            try:
+                widget.config(state=state)
+            except tk.TclError:
+                pass
+        preset_box.config(state="disabled" if is_busy else "readonly")
+
+    def selected_bed():
+        if bed_mode_var.get() == "Full A4 scan":
+            return BED
+        px = int(bed_size_var.get())
+        return px, px
+
+    def selected_params():
+        n = int(seed_var.get())
+        frac = float(touch_var.get()) / 100.0
+        cluster_max = max(2, int(cluster_var.get()))
+        csize = (2, cluster_max) if frac > 0 else (0, 0)
+        band = float(band_var.get())
+        n_dust = max(0, int(dust_var.get()))
+        scale = max(0.05, float(scale_var.get()))
+        gray = _gui_seed_gray(bright_var.get())
+        return n, frac, csize, band, n_dust, scale, gray
+
+    def apply_preset(_event=None):
+        name = preset_var.get()
+        if name == "custom":
+            return
+        n, frac, csize, band, n_dust, scale, gray = PRESETS[name]
+        seed_var.set(n)
+        touch_var.set(int(round(frac * 100)))
+        cluster_var.set(max(2, csize[1] if csize[1] else 8))
+        band_var.set(band)
+        dust_var.set(n_dust)
+        scale_var.set(scale)
+        bright_var.set(_gui_brightness_from_gray(gray))
+
+    preset_box.bind("<<ComboboxSelected>>", apply_preset)
+
+    def display_image(img):
+        pil = Image.fromarray(img)
+        pil.thumbnail((760, 680), Image.Resampling.LANCZOS)
+        photo = ImageTk.PhotoImage(pil)
+        image_label.config(image=photo)
+        image_label.image = photo
+        last["photo"] = photo
+
+    def default_save_path():
+        os.makedirs(OUT, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        name = f"gui_{stamp}_{int(seed_var.get())}seeds.png"
+        return os.path.join(OUT, name)
+
+    def format_results(truth, controls_row, save_path=None, measured=None, note=None):
+        lines = [
+            f"File: {os.path.basename(save_path) if save_path else '(not saved)'}",
+            f"Canvas: {truth['bed']}",
+            f"Requested seeds: {controls_row['requested_seeds']}",
+            f"Placed truth seeds: {truth['n_seeds']}",
+            f"Touching seeds: {truth['n_touching']} ({controls_row['touching_pct']}% requested)",
+            f"Footprint overlap: {truth['overlap_pct']:+.2f}%",
+            f"Fill: {truth['fill_pct']:.3f}%",
+            f"Mean seed area: {truth['mean_area_mm2']:.4f} mm^2",
+            f"Dust/chaff objects: {truth['n_dust']}",
+            f"Seed brightness: {controls_row['seed_brightness']}",
+            f"Seed size scale: {controls_row['seed_scale']}",
+            f"Scanner banding: {controls_row['band_amp']}",
+        ]
+        if truth["n_seeds"] != controls_row["requested_seeds"]:
+            lines.append("Placement note: not all requested seeds fit on this bed.")
+        if measured is not None:
+            got = int(measured["sscount"])
+            true_n = max(1, int(truth["n_seeds"]))
+            err = 100.0 * (got - true_n) / true_n
+            lines.extend([
+                "",
+                f"SeedSizer count: {got}",
+                f"Count error: {err:+.2f}%",
+                f"Accepted objects: {measured['AcceptedObjectCount']}",
+                f"Rejected objects: {measured['RejectedObjectCount']}",
+            ])
+            if measured["ProcessingNote"]:
+                lines.append(f"Note: {measured['ProcessingNote']}")
+        if note:
+            lines.extend(["", note])
+        return "\n".join(lines)
+
+    def run_job(save=False, analyze=False, save_as=False):
+        try:
+            params = selected_params()
+            bed = selected_bed()
+            seed = int(random_var.get())
+        except Exception as exc:
+            messagebox.showerror("Invalid settings", str(exc))
+            return
+
+        save_path = None
+        if save or analyze or save_as:
+            if save_as:
+                os.makedirs(OUT, exist_ok=True)
+                save_path = filedialog.asksaveasfilename(
+                    title="Save synthetic scan",
+                    initialdir=OUT,
+                    defaultextension=".png",
+                    filetypes=[("PNG image", "*.png")],
+                )
+                if not save_path:
+                    return
+            else:
+                save_path = default_save_path()
+
+        controls_row = {
+            "requested_seeds": params[0],
+            "preset": preset_var.get(),
+            "touching_pct": int(touch_var.get()),
+            "seed_brightness": f"{int(params[6][0])}-{int(params[6][1])}",
+            "seed_scale": float(params[5]),
+            "band_amp": float(params[3]),
+            "max_cluster_size": int(cluster_var.get()),
+        }
+
+        set_busy(True)
+        status_var.set("Generating synthetic scan...")
+
+        def worker():
+            try:
+                rng = np.random.default_rng(seed)
+                preset_name = controls_row["preset"] if controls_row["preset"] != "custom" else "custom_gui"
+                img, truth = generate(preset_name, rng, bed, params)
+                measured = None
+                if save_path:
+                    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+                    Image.fromarray(img).save(save_path)
+                    truth["file"] = os.path.basename(save_path)
+                if analyze:
+                    status = "Running SeedSizer on saved scan..."
+                    root.after(0, lambda: status_var.set(status))
+                    sys.path.insert(0, HERE)
+                    import SeedSizer as S
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        measured = S.Run(save_path)
+                if save_path:
+                    write_row = dict(truth)
+                    write_row.update(controls_row)
+                    write_row["file"] = os.path.basename(save_path)
+                    if measured is not None:
+                        got = int(measured["sscount"])
+                        true_n = max(1, int(truth["n_seeds"]))
+                        write_row["measured_count"] = got
+                        write_row["count_error_pct"] = round(100.0 * (got - true_n) / true_n, 3)
+                        write_row["processing_note"] = measured["ProcessingNote"]
+                    _gui_write_truth(write_row)
+                root.after(0, lambda: done(img, truth, save_path, measured, None))
+            except Exception:
+                err = traceback.format_exc()
+                root.after(0, lambda err=err: done(None, None, None, None, err))
+
+        def done(img, truth, path, measured, err):
+            set_busy(False)
+            if err:
+                status_var.set("Generation failed")
+                messagebox.showerror("Synthetic generator error", err)
+                return
+            last.update({"img": img, "truth": truth, "path": path})
+            display_image(img)
+            set_results(format_results(truth, controls_row, path, measured))
+            if measured is not None:
+                status_var.set("Saved and analyzed")
+            elif path:
+                status_var.set(f"Saved {os.path.basename(path)}")
+            else:
+                status_var.set("Preview generated")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    generate_button.config(command=lambda: run_job(save=False, analyze=False))
+    save_button.config(command=lambda: run_job(save=True, analyze=False))
+    analyze_button.config(command=lambda: run_job(save=True, analyze=True))
+    choose_button.config(command=lambda: run_job(save=True, analyze=False, save_as=True))
+
+    set_results("No scan generated yet.")
+    root.mainloop()
+
+
 # -------------------------------------------------------------------- check
 
 def demo():
@@ -666,7 +1035,7 @@ def demo():
 
 
 if __name__ == "__main__":
-    cmds = {"make": make, "screen": screen, "verify": verify, "batch": batch, "demo": demo}
+    cmds = {"make": make, "screen": screen, "verify": verify, "batch": batch, "gui": gui, "demo": demo}
     cmd = sys.argv[1] if len(sys.argv) > 1 else "demo"
     if cmd not in cmds:
         sys.exit(f"usage: python {os.path.basename(__file__)} "
