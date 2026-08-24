@@ -31,7 +31,7 @@ from tkinter import ttk
 from tkinter import filedialog
 from tkinter import messagebox
 
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageDraw
 Image.MAX_IMAGE_PIXELS = None  # disable Pillow’s decompression bomb limit - don't bomb yourself :P
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -65,6 +65,16 @@ MIN_PLAUSIBLE_DPI = 300
 MAX_PLAUSIBLE_DPI = 2400
 MAX_DPI_AXIS_MISMATCH = 0.02
 METADATA_DPI_WARNING = 0.02
+
+OVERLAY_MAX_SIDE = 1800
+OVERLAY_COLORS = {
+    "single": (46, 204, 113, 110),
+    "clump": (255, 193, 7, 135),
+    "rejected": (231, 76, 60, 115),
+    "single_outline": (0, 128, 72, 255),
+    "clump_outline": (176, 112, 0, 255),
+    "rejected_outline": (150, 28, 20, 255),
+}
 
 #################################################################################################################################################################################################
 #
@@ -271,7 +281,28 @@ def _degenerate_prefix(was_degenerate):
     return f"Otsu was degenerate; used fixed threshold {FALLBACK_THRESHOLD:.0f}. " if was_degenerate else ""
 
 
-def Run(filename, calibration=None):
+def _diagnostics_payload(path, grayscale_image, labeled_image, df_all, df_filtered, clumps,
+                         threshold_value, otsu_degenerate, result):
+    accepted_labels = set(df_filtered["label"].astype(int)) if "label" in df_filtered else set()
+    clump_labels = set(clumps["label"].astype(int)) if "label" in clumps else set()
+    all_labels = set(df_all["label"].astype(int)) if "label" in df_all else set()
+    return {
+        "path": path,
+        "grayscale": grayscale_image,
+        "labeled": labeled_image,
+        "df_all": df_all.copy(),
+        "df_filtered": df_filtered.copy(),
+        "clumps": clumps.copy(),
+        "accepted_labels": accepted_labels,
+        "clump_labels": clump_labels,
+        "rejected_labels": all_labels - accepted_labels,
+        "threshold": float(threshold_value),
+        "otsu_degenerate": bool(otsu_degenerate),
+        "result": result,
+    }
+
+
+def _analyze_scan(filename, calibration=None, include_diagnostics=False):
 
     ### Image Manipulation ###
 
@@ -313,15 +344,22 @@ def Run(filename, calibration=None):
             "solidity",
             "major_axis_length",
             "minor_axis_length",
+            "centroid",
         ],
     )        
                                                                                         # ^^ Collection of area's of the connected components (collection of adjascent pixels labeled 1, which make up the seed)
     df = pd.DataFrame(binary_seed)                                                      # This turns our dictionary of connected components into a pandas dataframe
+    df_all = df.copy()
     raw_object_count = len(df)
 
     if df.empty:
-        return _empty_result(path, _degenerate_prefix(otsu_degenerate)
-                             + "No seed-like objects found after thresholding.", raw_object_count, 0, calibration_info)
+        result = _empty_result(path, _degenerate_prefix(otsu_degenerate)
+                               + "No seed-like objects found after thresholding.", raw_object_count, 0, calibration_info)
+        diagnostics = _diagnostics_payload(
+            path, grayscale_image, labeled_image, df_all, df, pd.DataFrame(),
+            threshold_value, otsu_degenerate, result,
+        ) if include_diagnostics else None
+        return result, diagnostics
 
     df["area_mm2"] = df["area"] / pp_sqmm                                               # Convert connected components to mm^2 using the active scan calibration
     df["aspect_ratio"] = df["major_axis_length"] / df["minor_axis_length"]
@@ -330,9 +368,14 @@ def Run(filename, calibration=None):
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.dropna(inplace=True)
     if df.empty:
-        return _empty_result(path, _degenerate_prefix(otsu_degenerate)
-                             + "All detected objects had invalid shape measurements.", raw_object_count,
-                             calibration_info=calibration_info)
+        result = _empty_result(path, _degenerate_prefix(otsu_degenerate)
+                               + "All detected objects had invalid shape measurements.", raw_object_count,
+                               calibration_info=calibration_info)
+        diagnostics = _diagnostics_payload(
+            path, grayscale_image, labeled_image, df_all, df, pd.DataFrame(),
+            threshold_value, otsu_degenerate, result,
+        ) if include_diagnostics else None
+        return result, diagnostics
 
     ### Statistical Analysis ###
 
@@ -417,7 +460,7 @@ def Run(filename, calibration=None):
             print(f"Processing note: {processing_note}")
     print()
 
-    return {
+    result = {
         "fileName": path.name,
         "objectNumber": "",             # per-image summary => leave blank; see note below
         "Area": float(area_mean),       # mean area (mm^2)
@@ -437,6 +480,111 @@ def Run(filename, calibration=None):
         "ReferenceSeedArea": float(reference_seed_area),
         **_calibration_columns(calibration_info),
     }
+    diagnostics = _diagnostics_payload(
+        path, grayscale_image, labeled_image, df_all, df_filtered, clumps,
+        threshold_value, otsu_degenerate, result,
+    ) if include_diagnostics else None
+    return result, diagnostics
+
+
+def Run(filename, calibration=None):
+    result, _diagnostics = _analyze_scan(filename, calibration=calibration, include_diagnostics=False)
+    return result
+
+
+def _scale_to_uint8(grayscale_image):
+    finite = grayscale_image[np.isfinite(grayscale_image)]
+    if finite.size == 0:
+        return np.zeros(grayscale_image.shape, dtype=np.uint8)
+    low, high = np.percentile(finite, [1, 99])
+    if high <= low:
+        low, high = float(finite.min()), float(finite.max())
+    if high <= low:
+        return np.zeros(grayscale_image.shape, dtype=np.uint8)
+    scaled = (np.clip(grayscale_image, low, high) - low) * (255.0 / (high - low))
+    return scaled.astype(np.uint8)
+
+
+def _boundary_mask(mask):
+    if not np.any(mask):
+        return mask
+    eroded = ndi.binary_erosion(mask, structure=np.ones((3, 3), dtype=bool), border_value=0)
+    return mask ^ eroded
+
+
+def _make_overlay_image(diagnostics, max_side=OVERLAY_MAX_SIDE):
+    grayscale = diagnostics["grayscale"]
+    labeled_image = diagnostics["labeled"]
+    accepted_labels = diagnostics["accepted_labels"]
+    clump_labels = diagnostics["clump_labels"]
+    rejected_labels = diagnostics["rejected_labels"]
+    single_labels = accepted_labels - clump_labels
+
+    category = np.zeros(labeled_image.shape, dtype=np.uint8)
+    if rejected_labels:
+        category[np.isin(labeled_image, list(rejected_labels))] = 3
+    if single_labels:
+        category[np.isin(labeled_image, list(single_labels))] = 1
+    if clump_labels:
+        category[np.isin(labeled_image, list(clump_labels))] = 2
+
+    boundary = np.zeros(labeled_image.shape, dtype=np.uint8)
+    for value in (1, 2, 3):
+        mask = category == value
+        if np.any(mask):
+            boundary[_boundary_mask(mask)] = value
+
+    bg = Image.fromarray(_scale_to_uint8(grayscale)).convert("RGB")
+    original_size = bg.size
+    bg.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+    display_size = bg.size
+
+    category_img = Image.fromarray(category).resize(display_size, Image.Resampling.NEAREST)
+    boundary_img = Image.fromarray(boundary).resize(display_size, Image.Resampling.NEAREST)
+    category_small = np.array(category_img)
+    boundary_small = np.array(boundary_img)
+
+    overlay = Image.new("RGBA", display_size, (0, 0, 0, 0))
+    overlay_pixels = np.array(overlay)
+    color_map = {
+        1: OVERLAY_COLORS["single"],
+        2: OVERLAY_COLORS["clump"],
+        3: OVERLAY_COLORS["rejected"],
+    }
+    outline_map = {
+        1: OVERLAY_COLORS["single_outline"],
+        2: OVERLAY_COLORS["clump_outline"],
+        3: OVERLAY_COLORS["rejected_outline"],
+    }
+    for value, color in color_map.items():
+        overlay_pixels[category_small == value] = color
+    for value, color in outline_map.items():
+        overlay_pixels[boundary_small == value] = color
+
+    combined = Image.alpha_composite(bg.convert("RGBA"), Image.fromarray(overlay_pixels, mode="RGBA"))
+    draw = ImageDraw.Draw(combined)
+    scale_x = display_size[0] / max(1, original_size[0])
+    scale_y = display_size[1] / max(1, original_size[1])
+    clumps = diagnostics["clumps"]
+    if not clumps.empty:
+        for _, row in clumps.iterrows():
+            x = float(row.get("centroid-1", 0)) * scale_x
+            y = float(row.get("centroid-0", 0)) * scale_y
+            text = str(int(row.get("clump_size", 2)))
+            draw.text((x + 4, y + 4), text, fill=(255, 255, 255, 255))
+
+    return combined.convert("RGB")
+
+
+def CreateOverlay(filename, calibration=None, output_path=None, max_side=OVERLAY_MAX_SIDE):
+    result, diagnostics = _analyze_scan(filename, calibration=calibration, include_diagnostics=True)
+    overlay = _make_overlay_image(diagnostics, max_side=max_side)
+    if output_path:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        overlay.save(output_path)
+    return overlay, result
+
 
 # This is where we cycle through each image in the folder that was passed by the user
 def _find_tif_files(folder_path):
@@ -521,7 +669,7 @@ def Cycle(folder="Data", root=None, close_progress=False, progress_callback=None
         print(f"Selected folder does not exist: {folder_path}")
         if progress_callback:
             progress_callback("folder_error", folder_path=folder_path, message="Folder does not exist")
-        return
+        return {"folder": folder_path, "output_csv": None, "rows": []}
 
     tif_files = _find_tif_files(folder_path)
     output_csv = _output_csv_path(folder_path, output_dir, reserved_outputs)
@@ -556,7 +704,7 @@ def Cycle(folder="Data", root=None, close_progress=False, progress_callback=None
             progress_win.update()
             if close_progress:
                 progress_win.destroy()
-        return
+        return {"folder": folder_path, "output_csv": output_csv, "rows": []}
 
     result = []
     for i, tif_file in enumerate(tif_files):
@@ -577,6 +725,7 @@ def Cycle(folder="Data", root=None, close_progress=False, progress_callback=None
             progress_win.update()
 
         stats = Run(tif_file, calibration=calibration)
+        result.append({"path": tif_file, "stats": stats, "output_csv": output_csv})
 
         df_row = pd.DataFrame([stats]) 
         file_exists = output_csv.exists()
@@ -611,17 +760,258 @@ def Cycle(folder="Data", root=None, close_progress=False, progress_callback=None
         if close_progress:
             progress_win.destroy()
 
+    return {"folder": folder_path, "output_csv": output_csv, "rows": result}
+
 
 def CycleQueue(folders, root=None, output_dirs=None, calibration=None):
     folders = [Path(folder) for folder in folders if folder]
     output_dirs = list(output_dirs or [None] * len(folders))
     reserved_outputs = set()
     total_folders = len(folders)
+    queue_results = []
     for index, folder in enumerate(folders, start=1):
         print(f"Starting folder {index}/{total_folders}: {folder}", flush=True)
         output_dir = output_dirs[index - 1] if index - 1 < len(output_dirs) else None
-        Cycle(folder, root, close_progress=index < total_folders,
-              output_dir=output_dir, reserved_outputs=reserved_outputs, calibration=calibration)
+        summary = Cycle(folder, root, close_progress=index < total_folders,
+                        output_dir=output_dir, reserved_outputs=reserved_outputs, calibration=calibration)
+        if summary:
+            queue_results.extend(summary["rows"])
+    return queue_results
+
+
+def _short_note(text, limit=90):
+    text = str(text or "")
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
+def _show_overlay_window(parent, scan_path, calibration=None, default_dir=None):
+    scan_path = Path(scan_path)
+    overlay_win = tk.Toplevel(parent)
+    overlay_win.title(f"SeedSizer Overlay - {scan_path.name}")
+    overlay_win.geometry("1120x820")
+    overlay_win.minsize(840, 620)
+    overlay_win.configure(bg="#f4f7f5")
+
+    top = tk.Frame(overlay_win, bg="#f4f7f5")
+    top.pack(fill="x", padx=14, pady=(12, 8))
+    tk.Label(
+        top,
+        text=scan_path.name,
+        bg="#f4f7f5",
+        fg="#24322e",
+        font=("Segoe UI", 12, "bold"),
+        anchor="w",
+    ).pack(fill="x")
+
+    legend = tk.Frame(overlay_win, bg="#f4f7f5")
+    legend.pack(fill="x", padx=14, pady=(0, 8))
+    for label_text, color in (
+        ("Accepted single seeds", "#2ecc71"),
+        ("Counted clumps", "#ffc107"),
+        ("Rejected objects", "#e74c3c"),
+    ):
+        chip = tk.Canvas(legend, width=16, height=16, bg="#f4f7f5", highlightthickness=0)
+        chip.create_rectangle(2, 2, 14, 14, fill=color, outline="")
+        chip.pack(side="left", padx=(0, 5))
+        tk.Label(
+            legend,
+            text=label_text,
+            bg="#f4f7f5",
+            fg="#34423d",
+            font=("Segoe UI", 9),
+        ).pack(side="left", padx=(0, 16))
+
+    image_frame = tk.Frame(overlay_win, bg="#101820", highlightthickness=1, highlightbackground="#20343b")
+    image_frame.pack(fill="both", expand=True, padx=14, pady=(0, 10))
+    image_frame.columnconfigure(0, weight=1)
+    image_frame.rowconfigure(0, weight=1)
+
+    image_label = tk.Label(
+        image_frame,
+        text="Building overlay...",
+        bg="#101820",
+        fg="#c7d8d2",
+        font=("Segoe UI", 12),
+    )
+    image_label.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+
+    footer = tk.Frame(overlay_win, bg="#f4f7f5")
+    footer.pack(fill="x", padx=14, pady=(0, 12))
+    status = tk.StringVar(value="Thresholding scan and drawing detected objects...")
+    tk.Label(
+        footer,
+        textvariable=status,
+        bg="#f4f7f5",
+        fg="#52615c",
+        font=("Segoe UI", 9),
+        anchor="w",
+    ).pack(side="left", fill="x", expand=True)
+
+    save_button = ttk.Button(footer, text="Save Overlay", state=tk.DISABLED)
+    save_button.pack(side="right")
+
+    last = {"image": None, "photo": None}
+
+    def display_overlay(overlay, result, err):
+        if err is not None:
+            status.set("Overlay failed")
+            image_label.config(text="Could not build overlay.")
+            messagebox.showerror("SeedSizer Overlay", str(err), parent=overlay_win)
+            return
+
+        display = overlay.copy()
+        display.thumbnail((1040, 650), Image.Resampling.LANCZOS)
+        photo = ImageTk.PhotoImage(display)
+        image_label.config(image=photo, text="")
+        image_label.image = photo
+        last["image"] = overlay
+        last["photo"] = photo
+        status.set(
+            f"Count {result['sscount']} | accepted {result['AcceptedObjectCount']} | "
+            f"rejected {result['RejectedObjectCount']} | raw {result['RawObjectCount']}"
+        )
+        save_button.config(state=tk.NORMAL)
+
+    def save_overlay():
+        if last["image"] is None:
+            return
+        folder = Path(default_dir) if default_dir else scan_path.parent / "overlays"
+        folder.mkdir(parents=True, exist_ok=True)
+        filename = filedialog.asksaveasfilename(
+            parent=overlay_win,
+            title="Save overlay image",
+            initialdir=str(folder),
+            initialfile=f"{scan_path.stem}_overlay.png",
+            defaultextension=".png",
+            filetypes=[("PNG image", "*.png"), ("JPEG image", "*.jpg"), ("All files", "*.*")],
+        )
+        if filename:
+            last["image"].save(filename)
+            status.set(f"Saved overlay to {filename}")
+
+    save_button.config(command=save_overlay)
+
+    def worker():
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                overlay, result = CreateOverlay(scan_path, calibration=calibration)
+            overlay_win.after(0, lambda: display_overlay(overlay, result, None))
+        except Exception as exc:
+            overlay_win.after(0, lambda exc=exc: display_overlay(None, None, exc))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _show_results_window(parent, rows, title="SeedSizer Results", output_csv=None, calibration=None):
+    rows = list(rows or [])
+    if not rows:
+        messagebox.showinfo("SeedSizer Results", "No scan results to display.", parent=parent)
+        return
+
+    result_win = tk.Toplevel(parent)
+    result_win.title(title)
+    result_win.geometry("1120x560")
+    result_win.minsize(860, 420)
+    result_win.configure(bg="#f4f7f5")
+
+    header = tk.Frame(result_win, bg="#f4f7f5")
+    header.pack(fill="x", padx=14, pady=(12, 8))
+    tk.Label(
+        header,
+        text=title,
+        bg="#f4f7f5",
+        fg="#24322e",
+        font=("Segoe UI", 14, "bold"),
+        anchor="w",
+    ).pack(fill="x")
+    detail = f"Saved to {output_csv}" if output_csv else "Select a row to inspect detection highlighting."
+    tk.Label(
+        header,
+        text=detail,
+        bg="#f4f7f5",
+        fg="#52615c",
+        font=("Segoe UI", 9),
+        anchor="w",
+        wraplength=1040,
+    ).pack(fill="x", pady=(4, 0))
+
+    table_frame = tk.Frame(result_win, bg="#f4f7f5")
+    table_frame.pack(fill="both", expand=True, padx=14, pady=(0, 10))
+    columns = ("file", "count", "area", "accepted", "rejected", "raw", "dpi", "note")
+    tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
+    yscroll = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
+    xscroll = ttk.Scrollbar(table_frame, orient="horizontal", command=tree.xview)
+    tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+
+    headings = {
+        "file": ("File", 300),
+        "count": ("Count", 70),
+        "area": ("Avg seed mm^2", 110),
+        "accepted": ("Accepted", 80),
+        "rejected": ("Rejected", 80),
+        "raw": ("Raw", 70),
+        "dpi": ("DPI", 70),
+        "note": ("Note", 320),
+    }
+    for key, (text, width) in headings.items():
+        tree.heading(key, text=text)
+        tree.column(key, width=width, minwidth=50, stretch=key in {"file", "note"})
+
+    row_by_iid = {}
+    for index, row in enumerate(rows):
+        stats = row["stats"]
+        iid = str(index)
+        row_by_iid[iid] = row
+        tree.insert(
+            "",
+            tk.END,
+            iid=iid,
+            values=(
+                stats.get("fileName", Path(row["path"]).name),
+                stats.get("sscount", ""),
+                _format_number(stats.get("AvgSizeOfOneSeed", "")),
+                stats.get("AcceptedObjectCount", ""),
+                stats.get("RejectedObjectCount", ""),
+                stats.get("RawObjectCount", ""),
+                _format_number(stats.get("CalibrationPPI", ""), 1),
+                _short_note(stats.get("ProcessingNote") or stats.get("CalibrationNote")),
+            ),
+        )
+
+    tree.grid(row=0, column=0, sticky="nsew")
+    yscroll.grid(row=0, column=1, sticky="ns")
+    xscroll.grid(row=1, column=0, sticky="ew")
+    table_frame.columnconfigure(0, weight=1)
+    table_frame.rowconfigure(0, weight=1)
+
+    footer = tk.Frame(result_win, bg="#f4f7f5")
+    footer.pack(fill="x", padx=14, pady=(0, 12))
+    status = tk.StringVar(value=f"{len(rows)} scan result{'s' if len(rows) != 1 else ''}")
+    tk.Label(
+        footer,
+        textvariable=status,
+        bg="#f4f7f5",
+        fg="#52615c",
+        font=("Segoe UI", 9),
+        anchor="w",
+    ).pack(side="left", fill="x", expand=True)
+
+    def selected_row():
+        selection = tree.selection()
+        if not selection:
+            messagebox.showinfo("SeedSizer Results", "Select a scan row first.", parent=result_win)
+            return None
+        return row_by_iid[selection[0]]
+
+    def view_overlay():
+        row = selected_row()
+        if row:
+            default_dir = Path(row.get("output_csv")).parent / "overlays" if row.get("output_csv") else None
+            _show_overlay_window(result_win, row["path"], calibration=calibration, default_dir=default_dir)
+
+    overlay_button = ttk.Button(footer, text="View Overlay", command=view_overlay)
+    overlay_button.pack(side="right")
+    tree.bind("<Double-1>", lambda _event: view_overlay())
 
 
 def _draw_start_logo(canvas):
@@ -654,7 +1044,15 @@ def _draw_start_logo(canvas):
 def _run_single_folder_gui(root, output_dir=None, calibration=None):
     folder = filedialog.askdirectory(title="Select folder containing .TIFF images")
     if folder:
-        Cycle(folder, root, close_progress=False, output_dir=output_dir, calibration=calibration)
+        summary = Cycle(folder, root, close_progress=False, output_dir=output_dir, calibration=calibration)
+        if summary and summary["rows"]:
+            _show_results_window(
+                root,
+                summary["rows"],
+                title=f"SeedSizer Results - {Path(folder).name}",
+                output_csv=summary["output_csv"],
+                calibration=calibration,
+            )
 
 
 def _run_folder_queue_gui(root, default_output_dir=None, calibration=None):
@@ -791,6 +1189,7 @@ def _run_folder_queue_gui(root, default_output_dir=None, calibration=None):
             queue_win.protocol("WM_DELETE_WINDOW", lambda: None)
             total_folders = len(selected_folders)
             reserved_outputs = set()
+            queue_results = []
 
             for folder_index, folder in enumerate(list(selected_folders)):
                 queue_states[folder_index] = "Running"
@@ -824,13 +1223,15 @@ def _run_folder_queue_gui(root, default_output_dir=None, calibration=None):
                         label_file.config(text=str(info.get("folder_path", "")))
                     queue_win.update()
 
-                Cycle(
+                summary = Cycle(
                     folder,
                     progress_callback=update_progress,
                     output_dir=output_folders[folder_index],
                     reserved_outputs=reserved_outputs,
                     calibration=calibration,
                 )
+                if summary:
+                    queue_results.extend(summary["rows"])
                 queue_states[folder_index] = final_state["value"]
                 refresh_list()
 
@@ -839,6 +1240,14 @@ def _run_folder_queue_gui(root, default_output_dir=None, calibration=None):
             label_file.config(text="")
             is_running = False
             queue_win.protocol("WM_DELETE_WINDOW", queue_win.destroy)
+            set_queue_controls(True)
+            if queue_results:
+                _show_results_window(
+                    queue_win,
+                    queue_results,
+                    title="SeedSizer Queue Results",
+                    calibration=calibration,
+                )
 
     def cancel_queue():
         if not is_running:
@@ -916,7 +1325,13 @@ def _run_test_seedsizer_gui(root, calibration=None):
     random_seed = tk.IntVar(value=7)
     bed_pixels = tk.IntVar(value=2800)
     status = tk.StringVar(value="Ready")
-    last = {"photo": None}
+    last = {
+        "photo": None,
+        "scan_path": None,
+        "raw_image": None,
+        "overlay_image": None,
+        "overlay_visible": False,
+    }
     busy_widgets = []
 
     def add_row(row, label, widget):
@@ -978,8 +1393,10 @@ def _run_test_seedsizer_gui(root, calibration=None):
 
     preview_button = ttk.Button(button_box, text="Generate Preview", style="TestPrimary.TButton")
     run_button = ttk.Button(button_box, text="Run SeedSizer Test", style="TestPrimary.TButton")
+    overlay_button = ttk.Button(button_box, text="Show Detection Overlay", state=tk.DISABLED)
     preview_button.grid(row=0, column=0, sticky="ew", padx=(0, 5))
     run_button.grid(row=0, column=1, sticky="ew", padx=(5, 0))
+    overlay_button.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
     busy_widgets.extend([preview_button, run_button])
 
     row += 1
@@ -1066,12 +1483,30 @@ def _run_test_seedsizer_gui(root, calibration=None):
         )
 
     def display_image(img):
-        pil = Image.fromarray(img)
+        pil = img.copy() if isinstance(img, Image.Image) else Image.fromarray(img)
         pil.thumbnail((740, 690), Image.Resampling.LANCZOS)
         photo = ImageTk.PhotoImage(pil)
         preview_label.config(image=photo, text="")
         preview_label.image = photo
         last["photo"] = photo
+
+    def show_raw_preview():
+        if last["raw_image"] is not None:
+            display_image(last["raw_image"])
+            last["overlay_visible"] = False
+            overlay_button.config(text="Show Detection Overlay")
+
+    def show_detection_overlay():
+        if last["overlay_image"] is not None:
+            display_image(last["overlay_image"])
+            last["overlay_visible"] = True
+            overlay_button.config(text="Hide Detection Overlay")
+
+    def toggle_detection_overlay():
+        if last["overlay_visible"]:
+            show_raw_preview()
+        else:
+            show_detection_overlay()
 
     def output_path():
         out_dir = Path(__file__).resolve().parent / "SynthScans"
@@ -1132,6 +1567,10 @@ def _run_test_seedsizer_gui(root, calibration=None):
             return
 
         set_busy(True)
+        overlay_button.config(state=tk.DISABLED, text="Show Detection Overlay")
+        last["scan_path"] = None
+        last["overlay_image"] = None
+        last["overlay_visible"] = False
         status.set("Generating synthetic scan...")
 
         def worker():
@@ -1140,30 +1579,41 @@ def _run_test_seedsizer_gui(root, calibration=None):
                 img, truth = synth_test.generate("seedsizer_test", rng, (px, px), params)
                 measured = None
                 saved_path = None
+                overlay = None
                 if analyze:
                     saved_path = output_path()
                     Image.fromarray(img).save(saved_path, dpi=(PPI, PPI))
                     test_win.after(0, lambda: status.set("Running SeedSizer on the generated scan..."))
+                    test_win.after(0, lambda: status.set("Building detection overlay..."))
                     with contextlib.redirect_stdout(io.StringIO()):
-                        measured = Run(saved_path, calibration=calibration)
-                test_win.after(0, lambda: done(img, truth, measured, saved_path, None))
+                        overlay, measured = CreateOverlay(saved_path, calibration=calibration)
+                test_win.after(0, lambda: done(img, truth, measured, saved_path, overlay, None))
             except Exception as exc:
-                test_win.after(0, lambda exc=exc: done(None, None, None, None, exc))
+                test_win.after(0, lambda exc=exc: done(None, None, None, None, None, exc))
 
-        def done(img, truth, measured, saved_path, err):
+        def done(img, truth, measured, saved_path, overlay, err):
             set_busy(False)
             if err is not None:
                 status.set("Test failed")
                 messagebox.showerror("Test SeedSizer", str(err))
                 return
-            display_image(img)
+            last["raw_image"] = img
+            last["overlay_image"] = overlay
+            last["overlay_visible"] = False
+            if overlay is not None:
+                show_detection_overlay()
+            else:
+                display_image(img)
             set_results(format_results(truth, measured, saved_path))
+            last["scan_path"] = saved_path if measured is not None else None
+            overlay_button.config(state=tk.NORMAL if overlay is not None else tk.DISABLED)
             status.set("SeedSizer test complete" if measured is not None else "Preview generated")
 
         threading.Thread(target=worker, daemon=True).start()
 
     preview_button.config(command=lambda: run_test(False))
     run_button.config(command=lambda: run_test(True))
+    overlay_button.config(command=toggle_detection_overlay)
 
     set_results("No synthetic scan has been generated yet.")
     test_win.grab_set()

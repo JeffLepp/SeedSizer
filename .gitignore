@@ -9,7 +9,10 @@
 __pycache__/
 SixScan_Previews/
 *_flagged.xlsx
+*.xls
 *.xlsx
+*.xlsm
+*.xlsb
 *.csv
 !SynthScans/truth.csv
 

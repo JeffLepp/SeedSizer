@@ -30,6 +30,14 @@ folder, and each queued folder can also get its own output folder. Custom output
 folders add a short folder tag to CSV filenames so separate folders named `ALL`
 do not overwrite each other.
 
+After a GUI scan finishes, SeedSizer opens a results table. Select a row and use
+`View Overlay` to inspect the diagnostic highlighting for that TIFF. The
+synthetic test screen shows that highlighting directly over the preview after
+`Run SeedSizer Test`, with a toggle to compare raw and highlighted views. Green
+means accepted single seed, yellow means a counted clump with the estimated seed
+count, and red means a thresholded object that was rejected. Real-scan overlays
+are generated only when requested, and can be saved from the overlay window.
+
 The start menu also has calibration options. Automatic mode reads image DPI
 metadata when it looks reliable and falls back to the selected DPI when it does
 not. Manual mode forces the selected DPI. Fixed mode keeps the original 1200 DPI
