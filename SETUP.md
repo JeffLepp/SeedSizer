@@ -18,15 +18,18 @@ Check it works:
 
 | file | what it does |
 |---|---|
-| `SeedSizer.py` | the counter. `python SeedSizer.py` opens a folder picker and writes a CSV. |
+| `SeedSizer.py` | the counter. `python SeedSizer.py` opens a folder queue picker and writes one CSV per folder. |
 | `qc.py` | reconciles counts against balance weights and flags implausible TSM |
 | `synth_test.py` | draws scans with known seed counts and scores SeedSizer against them |
 | `tiles.py` | cuts real scans into windows for hand-counting, to check accuracy |
 | `sweep_test.py` | earlier threshold sweep, kept for reference |
 
+The folder queue window lets you add, remove, and reorder folders before running.
+It processes them one at a time and writes each folder's normal `<folder>_data.csv`.
+
 ## Before trusting counts on a different scanner
 
-The fallback threshold (`FALLBACK_THRESHOLD = 62` in SeedSizer.py) and the
+The fallback threshold (`FALLBACK_THRESHOLD = 50` in SeedSizer.py) and the
 constants in `synth_test.py` were measured on the 1200 PPI flatbed used for the
 2025 scans: background ~29.7, MAD ~3.46, seeds peaking at 124-135. On different
 hardware those numbers move, and a fallback above the seed brightness silently
