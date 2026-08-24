@@ -61,6 +61,10 @@ CLUMP_FACTOR = 1.9
 
 DEGENERATE_FG = 0.15                                                            # >15% of the bed being seed is physically impossible for one layer
 FALLBACK_THRESHOLD = 50.0                                                       # fallback for Otsu-degenerate scans; keeps dim seed bodies intact
+MIN_PLAUSIBLE_DPI = 300
+MAX_PLAUSIBLE_DPI = 2400
+MAX_DPI_AXIS_MISMATCH = 0.02
+METADATA_DPI_WARNING = 0.02
 
 #################################################################################################################################################################################################
 #
@@ -85,9 +89,154 @@ def _quality_note(parts):
     return " ".join(part for part in parts if part)
 
 
-def _empty_result(path, processing_note, raw_object_count, rejected_object_count=None):
+def _ratio_to_float(value):
+    if value is None:
+        return None
+    if isinstance(value, (tuple, list)) and len(value) == 2:
+        den = float(value[1])
+        return None if den == 0 else float(value[0]) / den
+    if hasattr(value, "numerator") and hasattr(value, "denominator"):
+        den = float(value.denominator)
+        return None if den == 0 else float(value.numerator) / den
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolution_unit_to_inches(unit):
+    if unit is None:
+        return 1.0
+    text = str(unit).lower()
+    if "centimeter" in text or text in {"3", "resolutionunit.centimeter"}:
+        return 2.54
+    if "inch" in text or text in {"2", "resolutionunit.inch"}:
+        return 1.0
+    return None
+
+
+def _read_metadata_dpi(path):
+    suffix = path.suffix.lower()
+    if suffix in {".tif", ".tiff"}:
+        try:
+            with tifffile.TiffFile(path) as tif:
+                tags = tif.pages[0].tags
+                x = _ratio_to_float(tags["XResolution"].value if "XResolution" in tags else None)
+                y = _ratio_to_float(tags["YResolution"].value if "YResolution" in tags else None)
+                unit = _resolution_unit_to_inches(tags["ResolutionUnit"].value if "ResolutionUnit" in tags else None)
+                if x and y and unit:
+                    return x * unit, y * unit, "TIFF metadata"
+        except Exception:
+            pass
+
+    try:
+        with Image.open(path) as img:
+            dpi = img.info.get("dpi")
+            if dpi and len(dpi) >= 2:
+                x = _ratio_to_float(dpi[0])
+                y = _ratio_to_float(dpi[1])
+                if x and y:
+                    return x, y, "image metadata"
+    except Exception:
+        pass
+
+    return None, None, None
+
+
+def _format_dpi(value):
+    return f"{float(value):.0f}" if abs(float(value) - round(float(value))) < 0.05 else f"{float(value):.1f}"
+
+
+def _calibration_from_settings(path, calibration=None):
+    calibration = calibration or {}
+    mode = calibration.get("mode", "auto")
+    default_dpi = float(calibration.get("default_dpi", PPI) or PPI)
+    manual_dpi = float(calibration.get("manual_dpi", default_dpi) or default_dpi)
+    ppi = default_dpi
+    mode_label = mode
+    notes = []
+
+    metadata_x, metadata_y, metadata_source = _read_metadata_dpi(path)
+    metadata_valid = False
+    metadata_ppi = None
+    if metadata_x and metadata_y:
+        metadata_ppi = (metadata_x + metadata_y) / 2.0
+        axis_mismatch = abs(metadata_x - metadata_y) / max(metadata_ppi, 1.0)
+        metadata_valid = (
+            MIN_PLAUSIBLE_DPI <= metadata_ppi <= MAX_PLAUSIBLE_DPI
+            and axis_mismatch <= MAX_DPI_AXIS_MISMATCH
+        )
+        if axis_mismatch > MAX_DPI_AXIS_MISMATCH:
+            notes.append(
+                f"Image DPI axes disagree ({_format_dpi(metadata_x)} x {_format_dpi(metadata_y)});"
+                f" using {_format_dpi(default_dpi)} DPI default."
+            )
+        elif not (MIN_PLAUSIBLE_DPI <= metadata_ppi <= MAX_PLAUSIBLE_DPI):
+            notes.append(
+                f"Image DPI metadata looks implausible ({_format_dpi(metadata_ppi)});"
+                f" using {_format_dpi(default_dpi)} DPI default."
+            )
+
+    if mode == "manual":
+        if MIN_PLAUSIBLE_DPI <= manual_dpi <= MAX_PLAUSIBLE_DPI:
+            ppi = manual_dpi
+            mode_label = "manual"
+            if metadata_valid and abs(metadata_ppi - ppi) / ppi > METADATA_DPI_WARNING:
+                notes.append(
+                    f"Manual DPI {_format_dpi(ppi)} overrides {metadata_source}"
+                    f" {_format_dpi(metadata_ppi)}."
+                )
+        else:
+            notes.append(
+                f"Manual DPI {_format_dpi(manual_dpi)} looks implausible;"
+                f" using {_format_dpi(default_dpi)} DPI default."
+            )
+    elif mode == "fixed":
+        ppi = default_dpi
+        mode_label = "fixed"
+        if metadata_valid and abs(metadata_ppi - ppi) / ppi > METADATA_DPI_WARNING:
+            notes.append(
+                f"Image metadata says {_format_dpi(metadata_ppi)} DPI;"
+                f" fixed setting uses {_format_dpi(ppi)} DPI."
+            )
+    else:
+        mode_label = "auto"
+        if metadata_valid:
+            ppi = metadata_ppi
+            if abs(ppi - default_dpi) / default_dpi > METADATA_DPI_WARNING:
+                notes.append(
+                    f"Using {metadata_source} DPI {_format_dpi(ppi)} instead of"
+                    f" default {_format_dpi(default_dpi)}."
+                )
+        elif not notes:
+            notes.append(
+                f"No reliable image DPI metadata found; using {_format_dpi(default_dpi)} DPI default."
+            )
+
+    pp_sqmm = (ppi / 25.4) ** 2
+    px_per_mm = ppi / 25.4
+    return {
+        "mode": mode_label,
+        "ppi": float(ppi),
+        "pp_sqmm": float(pp_sqmm),
+        "px_per_mm": float(px_per_mm),
+        "note": _quality_note(notes),
+    }
+
+
+def _calibration_columns(calibration_info):
+    return {
+        "CalibrationMode": calibration_info["mode"],
+        "CalibrationPPI": float(calibration_info["ppi"]),
+        "CalibrationNote": calibration_info["note"],
+    }
+
+
+def _empty_result(path, processing_note, raw_object_count, rejected_object_count=None, calibration_info=None):
     if rejected_object_count is None:
         rejected_object_count = raw_object_count
+    calibration_info = calibration_info or _calibration_from_settings(path)
+    processing_note = _quality_note([processing_note, calibration_info["note"]])
 
     print(f"Filepath: {path}")
     print("Total number of filtered seeds: 0")
@@ -112,6 +261,7 @@ def _empty_result(path, processing_note, raw_object_count, rejected_object_count
         "AcceptedObjectCount": 0,
         "RejectedObjectCount": int(rejected_object_count),
         "ReferenceSeedArea": "",
+        **_calibration_columns(calibration_info),
     }
 
 
@@ -121,11 +271,14 @@ def _degenerate_prefix(was_degenerate):
     return f"Otsu was degenerate; used fixed threshold {FALLBACK_THRESHOLD:.0f}. " if was_degenerate else ""
 
 
-def Run(filename):
+def Run(filename, calibration=None):
 
     ### Image Manipulation ###
 
     path = Path(filename).resolve()
+    calibration_info = _calibration_from_settings(path, calibration)
+    pp_sqmm = calibration_info["pp_sqmm"]
+    px_per_mm = calibration_info["px_per_mm"]
     raw_image = iio.imread(path)
     grayscale_image = _as_grayscale_float(raw_image)
     del raw_image
@@ -145,7 +298,7 @@ def Run(filename):
         threshold_value = FALLBACK_THRESHOLD
 
     binary_image = grayscale_image > threshold_value
-    binary_clean = remove_small_objects(binary_image, min_size=int(PP_SQMM * FILTER))
+    binary_clean = remove_small_objects(binary_image, min_size=int(pp_sqmm * FILTER))
     labeled_image = label(binary_clean)
 
 
@@ -168,17 +321,18 @@ def Run(filename):
 
     if df.empty:
         return _empty_result(path, _degenerate_prefix(otsu_degenerate)
-                             + "No seed-like objects found after thresholding.", raw_object_count, 0)
+                             + "No seed-like objects found after thresholding.", raw_object_count, 0, calibration_info)
 
-    df["area_mm2"] = df["area"] / PP_SQMM                                               # Convert these connected components to mm^2 since we know pixel is 1/1200 of an inch
+    df["area_mm2"] = df["area"] / pp_sqmm                                               # Convert connected components to mm^2 using the active scan calibration
     df["aspect_ratio"] = df["major_axis_length"] / df["minor_axis_length"]
-    df["length_mm"] = df["major_axis_length"] / PX_PER_MM
-    df["width_mm"] = df["minor_axis_length"] / PX_PER_MM
+    df["length_mm"] = df["major_axis_length"] / px_per_mm
+    df["width_mm"] = df["minor_axis_length"] / px_per_mm
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.dropna(inplace=True)
     if df.empty:
         return _empty_result(path, _degenerate_prefix(otsu_degenerate)
-                             + "All detected objects had invalid shape measurements.", raw_object_count)
+                             + "All detected objects had invalid shape measurements.", raw_object_count,
+                             calibration_info=calibration_info)
 
     ### Statistical Analysis ###
 
@@ -221,7 +375,7 @@ def Run(filename):
     if otsu_degenerate:
         quality_notes.append(
             f"Otsu was degenerate (>{DEGENERATE_FG:.0%} foreground); used fixed "
-            f"threshold {FALLBACK_THRESHOLD:.0f}. Scan is nearly empty - verify against weight."
+            f"threshold {FALLBACK_THRESHOLD:.0f}. Threshold metadata looked unreliable; inspect scan density, lighting, and background."
         )
     if pd.isna(mean_beta):
         if df_filtered.empty:
@@ -232,6 +386,8 @@ def Run(filename):
         quality_notes.append("Most thresholded objects were rejected as dust/artifacts.")
     if len(df_filtered) >= 20 and reference_seed_area <= MIN_REFERENCE_SEED_AREA_MM2 * 1.05:
         quality_notes.append("Reference seed area hit the lower safety bound; inspect scan quality.")
+    if calibration_info["note"]:
+        quality_notes.append(f"Calibration check: {calibration_info['note']}")
     processing_note = _quality_note(quality_notes)
 
     length_mm = df_filtered["length_mm"]
@@ -279,6 +435,7 @@ def Run(filename):
         "AcceptedObjectCount": int(len(df_filtered)),
         "RejectedObjectCount": int(raw_object_count - len(df_filtered)),
         "ReferenceSeedArea": float(reference_seed_area),
+        **_calibration_columns(calibration_info),
     }
 
 # This is where we cycle through each image in the folder that was passed by the user
@@ -358,7 +515,7 @@ def _create_progress_window(total_files, root=None):
 
 
 def Cycle(folder="Data", root=None, close_progress=False, progress_callback=None,
-          output_dir=None, reserved_outputs=None):
+          output_dir=None, reserved_outputs=None, calibration=None):
     folder_path = Path(folder)
     if not folder_path.is_dir():
         print(f"Selected folder does not exist: {folder_path}")
@@ -419,7 +576,7 @@ def Cycle(folder="Data", root=None, close_progress=False, progress_callback=None
             progress_bar["value"] = i
             progress_win.update()
 
-        stats = Run(tif_file)
+        stats = Run(tif_file, calibration=calibration)
 
         df_row = pd.DataFrame([stats]) 
         file_exists = output_csv.exists()
@@ -455,7 +612,7 @@ def Cycle(folder="Data", root=None, close_progress=False, progress_callback=None
             progress_win.destroy()
 
 
-def CycleQueue(folders, root=None, output_dirs=None):
+def CycleQueue(folders, root=None, output_dirs=None, calibration=None):
     folders = [Path(folder) for folder in folders if folder]
     output_dirs = list(output_dirs or [None] * len(folders))
     reserved_outputs = set()
@@ -464,7 +621,7 @@ def CycleQueue(folders, root=None, output_dirs=None):
         print(f"Starting folder {index}/{total_folders}: {folder}", flush=True)
         output_dir = output_dirs[index - 1] if index - 1 < len(output_dirs) else None
         Cycle(folder, root, close_progress=index < total_folders,
-              output_dir=output_dir, reserved_outputs=reserved_outputs)
+              output_dir=output_dir, reserved_outputs=reserved_outputs, calibration=calibration)
 
 
 def _draw_start_logo(canvas):
@@ -494,13 +651,13 @@ def _draw_start_logo(canvas):
     canvas.create_text(cx, 156, text="Scan. Count. Export.", fill="#b8cbc5", font=("Segoe UI", 12))
 
 
-def _run_single_folder_gui(root, output_dir=None):
+def _run_single_folder_gui(root, output_dir=None, calibration=None):
     folder = filedialog.askdirectory(title="Select folder containing .TIFF images")
     if folder:
-        Cycle(folder, root, close_progress=False, output_dir=output_dir)
+        Cycle(folder, root, close_progress=False, output_dir=output_dir, calibration=calibration)
 
 
-def _run_folder_queue_gui(root, default_output_dir=None):
+def _run_folder_queue_gui(root, default_output_dir=None, calibration=None):
     selected_folders = []
     output_folders = []
     queue_states = []
@@ -672,6 +829,7 @@ def _run_folder_queue_gui(root, default_output_dir=None):
                     progress_callback=update_progress,
                     output_dir=output_folders[folder_index],
                     reserved_outputs=reserved_outputs,
+                    calibration=calibration,
                 )
                 queue_states[folder_index] = final_state["value"]
                 refresh_list()
@@ -706,7 +864,7 @@ def _format_number(value, digits=3):
     return f"{float(value):.{digits}f}"
 
 
-def _run_test_seedsizer_gui(root):
+def _run_test_seedsizer_gui(root, calibration=None):
     try:
         import synth_test
     except Exception as exc:
@@ -945,18 +1103,19 @@ def _run_test_seedsizer_gui(root):
         if measured is not None:
             got = int(measured["sscount"])
             placed_err = 100.0 * (got - placed) / max(1, placed)
-            requested_err = 100.0 * (got - requested) / max(1, requested)
             lines.extend([
                 "",
                 "SeedSizer output",
                 f"Detected count: {got}",
                 f"Difference vs placed truth: {got - placed:+d} ({placed_err:+.2f}%)",
-                f"Difference vs requested setting: {got - requested:+d} ({requested_err:+.2f}%)",
                 f"Average single-seed area: {_format_number(measured['AvgSizeOfOneSeed'])} mm^2",
                 f"Accepted objects: {measured['AcceptedObjectCount']}",
                 f"Rejected objects: {measured['RejectedObjectCount']}",
                 f"Raw threshold objects: {measured['RawObjectCount']}",
+                f"Calibration DPI: {_format_number(measured['CalibrationPPI'], 1)}",
             ])
+            if measured["CalibrationNote"]:
+                lines.append(f"Calibration note: {measured['CalibrationNote']}")
             if measured["ProcessingNote"]:
                 lines.append(f"Processing note: {measured['ProcessingNote']}")
         if path is not None:
@@ -983,10 +1142,10 @@ def _run_test_seedsizer_gui(root):
                 saved_path = None
                 if analyze:
                     saved_path = output_path()
-                    Image.fromarray(img).save(saved_path)
+                    Image.fromarray(img).save(saved_path, dpi=(PPI, PPI))
                     test_win.after(0, lambda: status.set("Running SeedSizer on the generated scan..."))
                     with contextlib.redirect_stdout(io.StringIO()):
-                        measured = Run(saved_path)
+                        measured = Run(saved_path, calibration=calibration)
                 test_win.after(0, lambda: done(img, truth, measured, saved_path, None))
             except Exception as exc:
                 test_win.after(0, lambda exc=exc: done(None, None, None, None, exc))
@@ -1012,8 +1171,8 @@ def _run_test_seedsizer_gui(root):
 
 def _run_start_menu_gui(root):
     root.title("SeedSizer")
-    root.geometry("720x710")
-    root.minsize(620, 680)
+    root.geometry("720x800")
+    root.minsize(620, 760)
     root.configure(bg="#f4f7f5")
 
     style = ttk.Style(root)
@@ -1025,6 +1184,9 @@ def _run_start_menu_gui(root):
     style.configure("Exit.TButton", font=("Segoe UI", 11), padding=(14, 10))
     output_dir = {"path": None}
     output_text = tk.StringVar(value="Output folder: default next to each scan folder")
+    calibration_mode = tk.StringVar(value="Automatic")
+    calibration_dpi = tk.DoubleVar(value=PPI)
+    calibration_text = tk.StringVar()
 
     shell = tk.Frame(root, bg="#f4f7f5")
     shell.pack(fill="both", expand=True, padx=24, pady=22)
@@ -1087,27 +1249,112 @@ def _run_start_menu_gui(root):
     ttk.Button(output_buttons, text="Choose", command=choose_output_folder).pack(side="left")
     ttk.Button(output_buttons, text="Default", command=use_default_output_folder).pack(side="left", padx=(8, 0))
 
+    calibration_panel = tk.Frame(panel, bg="#e8efeb", highlightthickness=1, highlightbackground="#c9d6d0")
+    calibration_panel.grid(row=3, column=0, sticky="ew", pady=(0, 16))
+    calibration_panel.columnconfigure(1, weight=1)
+
+    tk.Label(
+        calibration_panel,
+        text="Calibration",
+        bg="#e8efeb",
+        fg="#2c3d37",
+        font=("Segoe UI", 10, "bold"),
+    ).grid(row=0, column=0, sticky="w", padx=10, pady=(9, 4))
+
+    mode_box = ttk.Combobox(
+        calibration_panel,
+        textvariable=calibration_mode,
+        values=("Automatic", "Manual DPI", "Use 1200 DPI"),
+        state="readonly",
+        width=14,
+    )
+    mode_box.grid(row=0, column=1, sticky="w", padx=(0, 10), pady=(9, 4))
+
+    tk.Label(
+        calibration_panel,
+        text="DPI",
+        bg="#e8efeb",
+        fg="#2c3d37",
+        font=("Segoe UI", 9),
+    ).grid(row=0, column=2, sticky="e", padx=(0, 6), pady=(9, 4))
+
+    dpi_box = tk.Spinbox(
+        calibration_panel,
+        from_=MIN_PLAUSIBLE_DPI,
+        to=MAX_PLAUSIBLE_DPI,
+        increment=50,
+        textvariable=calibration_dpi,
+        width=7,
+    )
+    dpi_box.grid(row=0, column=3, sticky="e", padx=(0, 10), pady=(9, 4))
+
+    tk.Label(
+        calibration_panel,
+        textvariable=calibration_text,
+        bg="#e8efeb",
+        fg="#52615c",
+        font=("Segoe UI", 9),
+        anchor="w",
+        wraplength=620,
+        justify="left",
+    ).grid(row=1, column=0, columnspan=4, sticky="ew", padx=10, pady=(0, 9))
+
+    def update_calibration_text(*_):
+        mode = calibration_mode.get()
+        try:
+            dpi_value = float(calibration_dpi.get())
+        except (tk.TclError, ValueError):
+            dpi_value = PPI
+        if mode == "Automatic":
+            calibration_text.set(
+                f"Reads image DPI when reliable; otherwise uses {_format_dpi(dpi_value)} DPI and writes a warning."
+            )
+        elif mode == "Manual DPI":
+            calibration_text.set(f"Always measures area and length using {_format_dpi(dpi_value)} DPI.")
+        else:
+            calibration_text.set(f"Always measures area and length using the SeedSizer default {_format_dpi(PPI)} DPI.")
+
+    def current_calibration():
+        mode_map = {
+            "Automatic": "auto",
+            "Manual DPI": "manual",
+            "Use 1200 DPI": "fixed",
+        }
+        try:
+            dpi_value = float(calibration_dpi.get())
+        except (tk.TclError, ValueError):
+            dpi_value = PPI
+        return {
+            "mode": mode_map.get(calibration_mode.get(), "auto"),
+            "default_dpi": dpi_value if calibration_mode.get() == "Automatic" else PPI,
+            "manual_dpi": dpi_value,
+        }
+
+    calibration_mode.trace_add("write", update_calibration_text)
+    calibration_dpi.trace_add("write", update_calibration_text)
+    update_calibration_text()
+
     buttons = tk.Frame(panel, bg="#f4f7f5")
-    buttons.grid(row=3, column=0, sticky="ew")
+    buttons.grid(row=4, column=0, sticky="ew")
     buttons.columnconfigure(0, weight=1)
 
     single_button = ttk.Button(
         buttons,
         text="Start Scanning",
         style="Start.TButton",
-        command=lambda: _run_single_folder_gui(root, output_dir["path"]),
+        command=lambda: _run_single_folder_gui(root, output_dir["path"], current_calibration()),
     )
     queue_button = ttk.Button(
         buttons,
         text="Multi-Folder Queue",
         style="Start.TButton",
-        command=lambda: _run_folder_queue_gui(root, output_dir["path"]),
+        command=lambda: _run_folder_queue_gui(root, output_dir["path"], current_calibration()),
     )
     test_button = ttk.Button(
         buttons,
         text="Test SeedSizer",
         style="Start.TButton",
-        command=lambda: _run_test_seedsizer_gui(root),
+        command=lambda: _run_test_seedsizer_gui(root, current_calibration()),
     )
     exit_button = ttk.Button(
         buttons,
@@ -1126,7 +1373,7 @@ def _run_start_menu_gui(root):
         bg="#f4f7f5",
         fg="#6c7a75",
         font=("Segoe UI", 9),
-    ).grid(row=4, column=0, sticky="w", pady=(16, 0))
+    ).grid(row=5, column=0, sticky="w", pady=(16, 0))
 
     root.mainloop()
 

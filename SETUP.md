@@ -24,8 +24,18 @@ Check it works:
 | `tiles.py` | cuts real scans into windows for hand-counting, to check accuracy |
 | `sweep_test.py` | earlier threshold sweep, kept for reference |
 
-The folder queue window lets you add, remove, and reorder folders before running.
-It processes them one at a time and writes each folder's normal `<folder>_data.csv`.
+The start menu lets you choose one scan folder, build a multi-folder queue, or
+open the synthetic SeedSizer test screen. You can choose a shared CSV output
+folder, and each queued folder can also get its own output folder. Custom output
+folders add a short folder tag to CSV filenames so separate folders named `ALL`
+do not overwrite each other.
+
+The start menu also has calibration options. Automatic mode reads image DPI
+metadata when it looks reliable and falls back to the selected DPI when it does
+not. Manual mode forces the selected DPI. Fixed mode keeps the original 1200 DPI
+SeedSizer assumption. Each CSV row includes `CalibrationMode`, `CalibrationPPI`,
+and `CalibrationNote`, and questionable calibration is repeated in
+`ProcessingNote`.
 
 ## Before trusting counts on a different scanner
 
@@ -42,6 +52,11 @@ Run this on a folder of real scans from the new machine:
 Synthetic and real should agree on median, MAD and the >kMAD tail. If they do
 not, the constants are stale and need re-measuring before the counts mean
 anything.
+
+Also confirm that the scanner writes the expected DPI. If image metadata is
+missing or suspicious, SeedSizer still runs with the selected fallback DPI, but
+the area, length, and TSM values should be treated as unverified until the DPI is
+confirmed.
 
 ## Known accuracy (as of 2026-08-13)
 
