@@ -4,6 +4,8 @@
 *.exe
 *.pkg
 *.spec
+.venv/
+venv/
 
 # analysis output
 __pycache__/

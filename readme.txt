@@ -1,7 +1,6 @@
 Designed For Vogel Plant Pathology Wheat Health and Genetics Research Unit. 
 
-This program was designed to analyze .tif flatbed scans of caminilla seeds behind a black surface, 
-if you're images differ from this there may be unexpected results, but should work if:
+This program was designed to analyze .tif flatbed scans of seeds behind a black surface, 
 
     1. You have brighter objects behind a dark surface
     2. Touching objects are limited as much as possible before scanning
@@ -25,22 +24,6 @@ if you're images differ from this there may be unexpected results, but should wo
 
 Expected Result: Updated output.csv which shows all .tiff files results sequentially. 
 Note: Results may take some time to initially print
-
-
-## This Python program analyzes high-resolution seed scan images (TIFF format) to calculate:
-
-- Total number of seeds
-- Size of each seed in scan
-- Total size of seed
-- General size analytics
-
-## Features
-
-- Reads large `.tif` seed images
-- Applies Otsu's threshold to distinguish seeds from the background
-- Filters out small objects (noise)
-- Outputs seed areas in a pandas DataFrame
-- calculates seed count, average size, total size, and other analytics
 
 ## Output 
 

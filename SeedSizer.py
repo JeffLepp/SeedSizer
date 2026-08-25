@@ -58,9 +58,18 @@ MAX_SINGLE_ASPECT_RATIO = 5.5
 MAX_CLUMP_ASPECT_RATIO = 9.0
 MIN_SOLIDITY = 0.45
 CLUMP_FACTOR = 1.9
+DEFAULT_CLUMP_MODE = "hybrid"
+CLUMP_MODES = {"area", "hybrid", "watershed"}
+START_LOGO_PATH = Path(__file__).resolve().parent / "Assets" / "seedsizer_logo_banner.png"
+START_LOGO_DEFAULT_WIDTH = 672
+START_LOGO_DEFAULT_HEIGHT = 273
 
 DEGENERATE_FG = 0.15                                                            # >15% of the bed being seed is physically impossible for one layer
 FALLBACK_THRESHOLD = 50.0                                                       # fallback for Otsu-degenerate scans; keeps dim seed bodies intact
+EMPTY_FOREGROUND_FG = 0.00001
+LOW_CONTRAST_GRAY = 18.0
+NOISY_BACKGROUND_MAD = 6.0
+THRESHOLD_DISAGREE_RATIO = 5.0
 MIN_PLAUSIBLE_DPI = 300
 MAX_PLAUSIBLE_DPI = 2400
 MAX_DPI_AXIS_MISMATCH = 0.02
@@ -97,6 +106,109 @@ def _as_grayscale_float(raw_image):
 
 def _quality_note(parts):
     return " ".join(part for part in parts if part)
+
+
+def _robust_median_mad(values):
+    values = np.asarray(values)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return 0.0, 0.0
+    median = float(np.median(values))
+    mad = float(np.median(np.abs(values - median))) * 1.4826
+    return median, mad
+
+
+def _foreground_fraction(grayscale_image, threshold_value):
+    return float((grayscale_image > threshold_value).mean())
+
+
+def _threshold_decision(grayscale_image):
+    sample = grayscale_image[::4, ::4]
+    finite = sample[np.isfinite(sample)]
+    if finite.size == 0:
+        return {
+            "threshold": FALLBACK_THRESHOLD,
+            "otsu_threshold": FALLBACK_THRESHOLD,
+            "otsu_foreground": 0.0,
+            "fallback_foreground": 0.0,
+            "category": "empty scan",
+            "used_fallback": True,
+            "note": f"Threshold check: image contained no finite pixel values; used fixed threshold {FALLBACK_THRESHOLD:.0f}.",
+        }
+
+    otsu_threshold = float(threshold_otsu(grayscale_image))
+    otsu_foreground = _foreground_fraction(grayscale_image, otsu_threshold)
+    fallback_foreground = _foreground_fraction(grayscale_image, FALLBACK_THRESHOLD)
+    median, mad = _robust_median_mad(finite)
+    p95, p99, p999 = (float(v) for v in np.percentile(finite, [95, 99, 99.9]))
+    contrast = p999 - median
+
+    category = "normal"
+    notes = []
+    if fallback_foreground <= EMPTY_FOREGROUND_FG and p999 <= FALLBACK_THRESHOLD:
+        category = "empty scan"
+        notes.append("almost no seed-bright pixels were present")
+    elif otsu_foreground > DEGENERATE_FG:
+        if contrast < LOW_CONTRAST_GRAY:
+            category = "low contrast scan"
+            notes.append("foreground contrast was low")
+        elif mad >= NOISY_BACKGROUND_MAD:
+            category = "noisy background"
+            notes.append("background noise was high")
+        else:
+            category = "too much foreground"
+            notes.append("Otsu marked too much of the bed as foreground")
+
+    otsu_too_much_foreground = otsu_foreground > DEGENERATE_FG
+    fallback_is_helpful = (
+        fallback_foreground > EMPTY_FOREGROUND_FG
+        and fallback_foreground <= DEGENERATE_FG
+        and fallback_foreground <= otsu_foreground * 0.75
+    )
+    fixed_is_much_smaller = (
+        otsu_too_much_foreground
+        and fallback_foreground > EMPTY_FOREGROUND_FG
+        and otsu_foreground / fallback_foreground >= THRESHOLD_DISAGREE_RATIO
+    )
+    if fixed_is_much_smaller:
+        notes.append("Otsu and fixed-threshold foreground disagreed strongly")
+
+    used_fallback = category == "empty scan" or (otsu_too_much_foreground and fallback_is_helpful)
+    threshold_value = FALLBACK_THRESHOLD if used_fallback else otsu_threshold
+    if used_fallback:
+        lead = (
+            f"Threshold check: {category}; used fixed threshold {FALLBACK_THRESHOLD:.0f} "
+            f"instead of Otsu {otsu_threshold:.1f}."
+        )
+    elif otsu_too_much_foreground:
+        lead = (
+            f"Threshold check: {category}; kept Otsu threshold {otsu_threshold:.1f} "
+            f"because fixed threshold {FALLBACK_THRESHOLD:.0f} did not reduce foreground."
+        )
+    else:
+        lead = f"Threshold check: Otsu threshold {otsu_threshold:.1f} accepted."
+
+    if notes:
+        lead += " " + ". ".join(notes) + "."
+    lead += (
+        f" Foreground: Otsu {otsu_foreground:.2%}, fixed {fallback_foreground:.2%}; "
+        f"background median {median:.1f}, MAD {mad:.1f}, p99.9 {p999:.1f}."
+    )
+
+    return {
+        "threshold": float(threshold_value),
+        "otsu_threshold": float(otsu_threshold),
+        "otsu_foreground": float(otsu_foreground),
+        "fallback_foreground": float(fallback_foreground),
+        "median": float(median),
+        "mad": float(mad),
+        "p95": float(p95),
+        "p99": float(p99),
+        "p999": float(p999),
+        "category": category,
+        "used_fallback": bool(used_fallback),
+        "note": lead if used_fallback or category != "normal" else "",
+    }
 
 
 def _ratio_to_float(value):
@@ -275,14 +387,16 @@ def _empty_result(path, processing_note, raw_object_count, rejected_object_count
     }
 
 
-def _degenerate_prefix(was_degenerate):
+def _degenerate_prefix(threshold_info):
     """Keep the fallback visible on the early-exit paths too, so a scan is never
     silently rescued without it showing up in the output."""
-    return f"Otsu was degenerate; used fixed threshold {FALLBACK_THRESHOLD:.0f}. " if was_degenerate else ""
+    if threshold_info and threshold_info.get("note"):
+        return threshold_info["note"] + " "
+    return ""
 
 
 def _diagnostics_payload(path, grayscale_image, labeled_image, df_all, df_filtered, clumps,
-                         threshold_value, otsu_degenerate, result):
+                         threshold_value, threshold_info, result):
     accepted_labels = set(df_filtered["label"].astype(int)) if "label" in df_filtered else set()
     clump_labels = set(clumps["label"].astype(int)) if "label" in clumps else set()
     all_labels = set(df_all["label"].astype(int)) if "label" in df_all else set()
@@ -297,12 +411,91 @@ def _diagnostics_payload(path, grayscale_image, labeled_image, df_all, df_filter
         "clump_labels": clump_labels,
         "rejected_labels": all_labels - accepted_labels,
         "threshold": float(threshold_value),
-        "otsu_degenerate": bool(otsu_degenerate),
+        "otsu_degenerate": bool(threshold_info.get("used_fallback", False)) if threshold_info else False,
+        "threshold_info": dict(threshold_info or {}),
         "result": result,
     }
 
 
-def _analyze_scan(filename, calibration=None, include_diagnostics=False):
+def _clump_count_area(row, reference_seed_area):
+    return max(2, int(round(float(row["area_mm2"]) / reference_seed_area)))
+
+
+def _clump_count_watershed(labeled_image, row, reference_seed_area, pp_sqmm):
+    area_estimate = _clump_count_area(row, reference_seed_area)
+    try:
+        label_id = int(row["label"])
+        y0, x0 = int(row["bbox-0"]), int(row["bbox-1"])
+        y1, x1 = int(row["bbox-2"]), int(row["bbox-3"])
+    except (KeyError, TypeError, ValueError):
+        return area_estimate, 0
+
+    mask = labeled_image[y0:y1, x0:x1] == label_id
+    if not np.any(mask):
+        return area_estimate, 0
+
+    seed_area_px = max(reference_seed_area * pp_sqmm, 1.0)
+    seed_radius_px = np.sqrt(seed_area_px / np.pi)
+    min_distance = max(6, int(seed_radius_px * 0.55))
+    distance = ndi.distance_transform_edt(mask)
+    coords = peak_local_max(
+        distance,
+        labels=mask,
+        min_distance=min_distance,
+        threshold_abs=max(2.0, seed_radius_px * 0.25),
+        exclude_border=False,
+        num_peaks=max(2, int(area_estimate * 2.5)),
+    )
+    if len(coords) < 2:
+        return area_estimate, int(len(coords))
+
+    markers = np.zeros(mask.shape, dtype=np.int32)
+    for index, (y, x) in enumerate(coords, start=1):
+        markers[y, x] = index
+    segments = watershed(-distance, markers, mask=mask)
+    props = regionprops(segments)
+    min_segment_area = seed_area_px * 0.25
+    valid_segments = [prop for prop in props if prop.area >= min_segment_area]
+    if len(valid_segments) < 2:
+        return area_estimate, int(len(valid_segments))
+    return int(len(valid_segments)), int(len(valid_segments))
+
+
+def _apply_clump_counts(clumps, labeled_image, reference_seed_area, pp_sqmm, clump_mode):
+    if clump_mode not in CLUMP_MODES:
+        clump_mode = DEFAULT_CLUMP_MODE
+
+    if clumps.empty:
+        clumps["clump_size_area"] = []
+        clumps["clump_size_split"] = []
+        clumps["clump_size"] = []
+        return clumps
+
+    clumps = clumps.copy()
+    area_counts = []
+    split_counts = []
+    final_counts = []
+    for _, row in clumps.iterrows():
+        area_count = _clump_count_area(row, reference_seed_area)
+        split_count, split_markers = _clump_count_watershed(labeled_image, row, reference_seed_area, pp_sqmm)
+        area_counts.append(area_count)
+        split_counts.append(split_count if split_markers >= 2 else 0)
+        if clump_mode == "watershed":
+            final_counts.append(split_count)
+        elif clump_mode == "hybrid" and split_markers >= 2 and 0.5 * area_count <= split_count <= 1.8 * area_count:
+            final_counts.append(split_count)
+        else:
+            final_counts.append(area_count)
+
+    clumps["clump_size_area"] = area_counts
+    clumps["clump_size_split"] = split_counts
+    clumps["clump_size"] = final_counts
+    return clumps
+
+
+def _analyze_scan(filename, calibration=None, include_diagnostics=False, clump_mode=DEFAULT_CLUMP_MODE):
+    if clump_mode not in CLUMP_MODES:
+        clump_mode = DEFAULT_CLUMP_MODE
 
     ### Image Manipulation ###
 
@@ -315,18 +508,8 @@ def _analyze_scan(filename, calibration=None, include_diagnostics=False):
     del raw_image
     gc.collect() 
 
-    threshold_value = threshold_otsu(grayscale_image)
-
-    # Otsu splits a histogram into two modes. A nearly empty scan only has one -
-    # the background - so Otsu splits background noise instead and calls half the
-    # bed "seed"; the clump divider then turns that single blob into tens of
-    # thousands of phantom seeds (Pot_208: 12 real seeds reported as 154,147).
-    # No seed layer can cover 15% of the bed, so treat that as the tell and use
-    # a fixed threshold that keeps dim seed bodies intact instead of isolating
-    # only bright cores (Pot_163: ~16 real seeds reported as 32 at threshold 62).
-    otsu_degenerate = float((grayscale_image > threshold_value).mean()) > DEGENERATE_FG
-    if otsu_degenerate:
-        threshold_value = FALLBACK_THRESHOLD
+    threshold_info = _threshold_decision(grayscale_image)
+    threshold_value = threshold_info["threshold"]
 
     binary_image = grayscale_image > threshold_value
     binary_clean = remove_small_objects(binary_image, min_size=int(pp_sqmm * FILTER))
@@ -340,6 +523,7 @@ def _analyze_scan(filename, calibration=None, include_diagnostics=False):
         properties=[
             "label",
             "area",
+            "bbox",
             "eccentricity",
             "solidity",
             "major_axis_length",
@@ -353,11 +537,11 @@ def _analyze_scan(filename, calibration=None, include_diagnostics=False):
     raw_object_count = len(df)
 
     if df.empty:
-        result = _empty_result(path, _degenerate_prefix(otsu_degenerate)
+        result = _empty_result(path, _degenerate_prefix(threshold_info)
                                + "No seed-like objects found after thresholding.", raw_object_count, 0, calibration_info)
         diagnostics = _diagnostics_payload(
             path, grayscale_image, labeled_image, df_all, df, pd.DataFrame(),
-            threshold_value, otsu_degenerate, result,
+            threshold_value, threshold_info, result,
         ) if include_diagnostics else None
         return result, diagnostics
 
@@ -368,12 +552,12 @@ def _analyze_scan(filename, calibration=None, include_diagnostics=False):
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.dropna(inplace=True)
     if df.empty:
-        result = _empty_result(path, _degenerate_prefix(otsu_degenerate)
+        result = _empty_result(path, _degenerate_prefix(threshold_info)
                                + "All detected objects had invalid shape measurements.", raw_object_count,
                                calibration_info=calibration_info)
         diagnostics = _diagnostics_payload(
             path, grayscale_image, labeled_image, df_all, df, pd.DataFrame(),
-            threshold_value, otsu_degenerate, result,
+            threshold_value, threshold_info, result,
         ) if include_diagnostics else None
         return result, diagnostics
 
@@ -405,7 +589,7 @@ def _analyze_scan(filename, calibration=None, include_diagnostics=False):
     ]
 
     clumps = df_filtered[df_filtered["area_mm2"] > CLUMP_FACTOR * reference_seed_area].copy()
-    clumps["clump_size"] = np.maximum(2, (clumps["area_mm2"] / reference_seed_area).round().astype(int))
+    clumps = _apply_clump_counts(clumps, labeled_image, reference_seed_area, pp_sqmm, clump_mode)
 
     size_clumps = clumps["clump_size"].sum()                                            # Counting number of seeds in clumps
     size_singles = len(df_filtered[df_filtered["area_mm2"] <= CLUMP_FACTOR * reference_seed_area])
@@ -415,11 +599,18 @@ def _analyze_scan(filename, calibration=None, include_diagnostics=False):
     single_seed_areas = df_filtered[df_filtered["area_mm2"] <= CLUMP_FACTOR * reference_seed_area]["area_mm2"]
     mean_beta = single_seed_areas.mean()
     quality_notes = []
-    if otsu_degenerate:
-        quality_notes.append(
-            f"Otsu was degenerate (>{DEGENERATE_FG:.0%} foreground); used fixed "
-            f"threshold {FALLBACK_THRESHOLD:.0f}. Threshold metadata looked unreliable; inspect scan density, lighting, and background."
-        )
+    if threshold_info["note"]:
+        quality_notes.append(threshold_info["note"])
+    if clump_mode != "area" and not clumps.empty:
+        area_total = int(clumps["clump_size_area"].sum())
+        split_total = int(clumps["clump_size_split"].replace(0, np.nan).dropna().sum())
+        final_total = int(clumps["clump_size"].sum())
+        if abs(final_total - area_total) >= max(3, int(0.05 * max(area_total, 1))):
+            quality_notes.append(
+                f"Clump splitting adjusted counted clumps to {final_total} seeds "
+                f"versus {area_total} by area estimate"
+                + (f" and {split_total} by watershed markers." if split_total else ".")
+            )
     if pd.isna(mean_beta):
         if df_filtered.empty:
             quality_notes.append("No filtered seed objects found; average single seed size unavailable.")
@@ -478,17 +669,23 @@ def _analyze_scan(filename, calibration=None, include_diagnostics=False):
         "AcceptedObjectCount": int(len(df_filtered)),
         "RejectedObjectCount": int(raw_object_count - len(df_filtered)),
         "ReferenceSeedArea": float(reference_seed_area),
+        "ThresholdMethod": "fixed_fallback" if threshold_info["used_fallback"] else "otsu",
+        "ThresholdValue": float(threshold_value),
+        "ThresholdCategory": threshold_info["category"],
+        "ThresholdOtsuForeground": float(threshold_info["otsu_foreground"]),
+        "ThresholdFallbackForeground": float(threshold_info["fallback_foreground"]),
+        "ClumpMode": clump_mode,
         **_calibration_columns(calibration_info),
     }
     diagnostics = _diagnostics_payload(
         path, grayscale_image, labeled_image, df_all, df_filtered, clumps,
-        threshold_value, otsu_degenerate, result,
+        threshold_value, threshold_info, result,
     ) if include_diagnostics else None
     return result, diagnostics
 
 
-def Run(filename, calibration=None):
-    result, _diagnostics = _analyze_scan(filename, calibration=calibration, include_diagnostics=False)
+def Run(filename, calibration=None, clump_mode=DEFAULT_CLUMP_MODE):
+    result, _diagnostics = _analyze_scan(filename, calibration=calibration, include_diagnostics=False, clump_mode=clump_mode)
     return result
 
 
@@ -576,8 +773,8 @@ def _make_overlay_image(diagnostics, max_side=OVERLAY_MAX_SIDE):
     return combined.convert("RGB")
 
 
-def CreateOverlay(filename, calibration=None, output_path=None, max_side=OVERLAY_MAX_SIDE):
-    result, diagnostics = _analyze_scan(filename, calibration=calibration, include_diagnostics=True)
+def CreateOverlay(filename, calibration=None, output_path=None, max_side=OVERLAY_MAX_SIDE, clump_mode=DEFAULT_CLUMP_MODE):
+    result, diagnostics = _analyze_scan(filename, calibration=calibration, include_diagnostics=True, clump_mode=clump_mode)
     overlay = _make_overlay_image(diagnostics, max_side=max_side)
     if output_path:
         output_path = Path(output_path)
@@ -663,7 +860,7 @@ def _create_progress_window(total_files, root=None):
 
 
 def Cycle(folder="Data", root=None, close_progress=False, progress_callback=None,
-          output_dir=None, reserved_outputs=None, calibration=None):
+          output_dir=None, reserved_outputs=None, calibration=None, clump_mode=DEFAULT_CLUMP_MODE):
     folder_path = Path(folder)
     if not folder_path.is_dir():
         print(f"Selected folder does not exist: {folder_path}")
@@ -724,7 +921,7 @@ def Cycle(folder="Data", root=None, close_progress=False, progress_callback=None
             progress_bar["value"] = i
             progress_win.update()
 
-        stats = Run(tif_file, calibration=calibration)
+        stats = Run(tif_file, calibration=calibration, clump_mode=clump_mode)
         result.append({"path": tif_file, "stats": stats, "output_csv": output_csv})
 
         df_row = pd.DataFrame([stats]) 
@@ -763,7 +960,7 @@ def Cycle(folder="Data", root=None, close_progress=False, progress_callback=None
     return {"folder": folder_path, "output_csv": output_csv, "rows": result}
 
 
-def CycleQueue(folders, root=None, output_dirs=None, calibration=None):
+def CycleQueue(folders, root=None, output_dirs=None, calibration=None, clump_mode=DEFAULT_CLUMP_MODE):
     folders = [Path(folder) for folder in folders if folder]
     output_dirs = list(output_dirs or [None] * len(folders))
     reserved_outputs = set()
@@ -773,7 +970,8 @@ def CycleQueue(folders, root=None, output_dirs=None, calibration=None):
         print(f"Starting folder {index}/{total_folders}: {folder}", flush=True)
         output_dir = output_dirs[index - 1] if index - 1 < len(output_dirs) else None
         summary = Cycle(folder, root, close_progress=index < total_folders,
-                        output_dir=output_dir, reserved_outputs=reserved_outputs, calibration=calibration)
+                        output_dir=output_dir, reserved_outputs=reserved_outputs,
+                        calibration=calibration, clump_mode=clump_mode)
         if summary:
             queue_results.extend(summary["rows"])
     return queue_results
@@ -784,7 +982,7 @@ def _short_note(text, limit=90):
     return text if len(text) <= limit else text[:limit - 3] + "..."
 
 
-def _show_overlay_window(parent, scan_path, calibration=None, default_dir=None):
+def _show_overlay_window(parent, scan_path, calibration=None, default_dir=None, clump_mode=DEFAULT_CLUMP_MODE):
     scan_path = Path(scan_path)
     overlay_win = tk.Toplevel(parent)
     overlay_win.title(f"SeedSizer Overlay - {scan_path.name}")
@@ -894,7 +1092,7 @@ def _show_overlay_window(parent, scan_path, calibration=None, default_dir=None):
     def worker():
         try:
             with contextlib.redirect_stdout(io.StringIO()):
-                overlay, result = CreateOverlay(scan_path, calibration=calibration)
+                overlay, result = CreateOverlay(scan_path, calibration=calibration, clump_mode=clump_mode)
             overlay_win.after(0, lambda: display_overlay(overlay, result, None))
         except Exception as exc:
             overlay_win.after(0, lambda exc=exc: display_overlay(None, None, exc))
@@ -902,7 +1100,7 @@ def _show_overlay_window(parent, scan_path, calibration=None, default_dir=None):
     threading.Thread(target=worker, daemon=True).start()
 
 
-def _show_results_window(parent, rows, title="SeedSizer Results", output_csv=None, calibration=None):
+def _show_results_window(parent, rows, title="SeedSizer Results", output_csv=None, calibration=None, clump_mode=DEFAULT_CLUMP_MODE):
     rows = list(rows or [])
     if not rows:
         messagebox.showinfo("SeedSizer Results", "No scan results to display.", parent=parent)
@@ -937,7 +1135,7 @@ def _show_results_window(parent, rows, title="SeedSizer Results", output_csv=Non
 
     table_frame = tk.Frame(result_win, bg="#f4f7f5")
     table_frame.pack(fill="both", expand=True, padx=14, pady=(0, 10))
-    columns = ("file", "count", "area", "accepted", "rejected", "raw", "dpi", "note")
+    columns = ("file", "count", "area", "accepted", "rejected", "raw", "clump", "dpi", "note")
     tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
     yscroll = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
     xscroll = ttk.Scrollbar(table_frame, orient="horizontal", command=tree.xview)
@@ -950,8 +1148,9 @@ def _show_results_window(parent, rows, title="SeedSizer Results", output_csv=Non
         "accepted": ("Accepted", 80),
         "rejected": ("Rejected", 80),
         "raw": ("Raw", 70),
+        "clump": ("Clumps", 80),
         "dpi": ("DPI", 70),
-        "note": ("Note", 320),
+        "note": ("Note", 280),
     }
     for key, (text, width) in headings.items():
         tree.heading(key, text=text)
@@ -973,6 +1172,7 @@ def _show_results_window(parent, rows, title="SeedSizer Results", output_csv=Non
                 stats.get("AcceptedObjectCount", ""),
                 stats.get("RejectedObjectCount", ""),
                 stats.get("RawObjectCount", ""),
+                stats.get("ClumpMode", DEFAULT_CLUMP_MODE),
                 _format_number(stats.get("CalibrationPPI", ""), 1),
                 _short_note(stats.get("ProcessingNote") or stats.get("CalibrationNote")),
             ),
@@ -1007,14 +1207,21 @@ def _show_results_window(parent, rows, title="SeedSizer Results", output_csv=Non
         row = selected_row()
         if row:
             default_dir = Path(row.get("output_csv")).parent / "overlays" if row.get("output_csv") else None
-            _show_overlay_window(result_win, row["path"], calibration=calibration, default_dir=default_dir)
+            row_mode = row.get("stats", {}).get("ClumpMode", clump_mode)
+            _show_overlay_window(
+                result_win,
+                row["path"],
+                calibration=calibration,
+                default_dir=default_dir,
+                clump_mode=row_mode,
+            )
 
     overlay_button = ttk.Button(footer, text="View Overlay", command=view_overlay)
     overlay_button.pack(side="right")
     tree.bind("<Double-1>", lambda _event: view_overlay())
 
 
-def _draw_start_logo(canvas):
+def _draw_start_logo_fallback(canvas):
     canvas.delete("all")
     w = int(canvas.winfo_width() or 620)
     h = int(canvas.winfo_height() or 190)
@@ -1041,10 +1248,47 @@ def _draw_start_logo(canvas):
     canvas.create_text(cx, 156, text="Scan. Count. Export.", fill="#b8cbc5", font=("Segoe UI", 12))
 
 
-def _run_single_folder_gui(root, output_dir=None, calibration=None):
+def _draw_start_logo(canvas):
+    canvas.delete("all")
+    try:
+        source = getattr(canvas, "_start_logo_source", None)
+        if source is None:
+            source = Image.open(START_LOGO_PATH).convert("RGB")
+            canvas._start_logo_source = source
+
+        w = int(canvas.winfo_width() or START_LOGO_DEFAULT_WIDTH)
+        h = int(canvas.winfo_height() or START_LOGO_DEFAULT_HEIGHT)
+        desired_h = max(260, round(w * source.height / source.width))
+        if abs(h - desired_h) > 1:
+            canvas.configure(height=desired_h)
+            h = desired_h
+
+        scale = max(w / source.width, h / source.height)
+        resized = source.resize(
+            (max(1, round(source.width * scale)), max(1, round(source.height * scale))),
+            Image.Resampling.LANCZOS,
+        )
+        left = max(0, (resized.width - w) // 2)
+        top = max(0, (resized.height - h) // 2)
+        display = resized.crop((left, top, left + w, top + h))
+        photo = ImageTk.PhotoImage(display)
+        canvas._start_logo_photo = photo
+        canvas.create_image(w // 2, h // 2, image=photo, anchor="center")
+    except Exception:
+        _draw_start_logo_fallback(canvas)
+
+
+def _run_single_folder_gui(root, output_dir=None, calibration=None, clump_mode=DEFAULT_CLUMP_MODE):
     folder = filedialog.askdirectory(title="Select folder containing .TIFF images")
     if folder:
-        summary = Cycle(folder, root, close_progress=False, output_dir=output_dir, calibration=calibration)
+        summary = Cycle(
+            folder,
+            root,
+            close_progress=False,
+            output_dir=output_dir,
+            calibration=calibration,
+            clump_mode=clump_mode,
+        )
         if summary and summary["rows"]:
             _show_results_window(
                 root,
@@ -1052,10 +1296,11 @@ def _run_single_folder_gui(root, output_dir=None, calibration=None):
                 title=f"SeedSizer Results - {Path(folder).name}",
                 output_csv=summary["output_csv"],
                 calibration=calibration,
+                clump_mode=clump_mode,
             )
 
 
-def _run_folder_queue_gui(root, default_output_dir=None, calibration=None):
+def _run_folder_queue_gui(root, default_output_dir=None, calibration=None, clump_mode=DEFAULT_CLUMP_MODE):
     selected_folders = []
     output_folders = []
     queue_states = []
@@ -1229,6 +1474,7 @@ def _run_folder_queue_gui(root, default_output_dir=None, calibration=None):
                     output_dir=output_folders[folder_index],
                     reserved_outputs=reserved_outputs,
                     calibration=calibration,
+                    clump_mode=clump_mode,
                 )
                 if summary:
                     queue_results.extend(summary["rows"])
@@ -1247,6 +1493,7 @@ def _run_folder_queue_gui(root, default_output_dir=None, calibration=None):
                     queue_results,
                     title="SeedSizer Queue Results",
                     calibration=calibration,
+                    clump_mode=clump_mode,
                 )
 
     def cancel_queue():
@@ -1273,7 +1520,7 @@ def _format_number(value, digits=3):
     return f"{float(value):.{digits}f}"
 
 
-def _run_test_seedsizer_gui(root, calibration=None):
+def _run_test_seedsizer_gui(root, calibration=None, clump_mode=DEFAULT_CLUMP_MODE):
     try:
         import synth_test
     except Exception as exc:
@@ -1547,6 +1794,7 @@ def _run_test_seedsizer_gui(root, calibration=None):
                 f"Accepted objects: {measured['AcceptedObjectCount']}",
                 f"Rejected objects: {measured['RejectedObjectCount']}",
                 f"Raw threshold objects: {measured['RawObjectCount']}",
+                f"Clump counting: {measured.get('ClumpMode', clump_mode)}",
                 f"Calibration DPI: {_format_number(measured['CalibrationPPI'], 1)}",
             ])
             if measured["CalibrationNote"]:
@@ -1586,7 +1834,11 @@ def _run_test_seedsizer_gui(root, calibration=None):
                     test_win.after(0, lambda: status.set("Running SeedSizer on the generated scan..."))
                     test_win.after(0, lambda: status.set("Building detection overlay..."))
                     with contextlib.redirect_stdout(io.StringIO()):
-                        overlay, measured = CreateOverlay(saved_path, calibration=calibration)
+                        overlay, measured = CreateOverlay(
+                            saved_path,
+                            calibration=calibration,
+                            clump_mode=clump_mode,
+                        )
                 test_win.after(0, lambda: done(img, truth, measured, saved_path, overlay, None))
             except Exception as exc:
                 test_win.after(0, lambda exc=exc: done(None, None, None, None, None, exc))
@@ -1621,8 +1873,8 @@ def _run_test_seedsizer_gui(root, calibration=None):
 
 def _run_start_menu_gui(root):
     root.title("SeedSizer")
-    root.geometry("720x800")
-    root.minsize(620, 760)
+    root.geometry("720x900")
+    root.minsize(620, 840)
     root.configure(bg="#f4f7f5")
 
     style = ttk.Style(root)
@@ -1636,14 +1888,13 @@ def _run_start_menu_gui(root):
     output_text = tk.StringVar(value="Output folder: default next to each scan folder")
     calibration_mode = tk.StringVar(value="Automatic")
     calibration_dpi = tk.DoubleVar(value=PPI)
-    calibration_text = tk.StringVar()
 
     shell = tk.Frame(root, bg="#f4f7f5")
     shell.pack(fill="both", expand=True, padx=24, pady=22)
     shell.columnconfigure(0, weight=1)
     shell.rowconfigure(1, weight=1)
 
-    logo = tk.Canvas(shell, height=190, highlightthickness=0, bg="#101820")
+    logo = tk.Canvas(shell, height=START_LOGO_DEFAULT_HEIGHT, highlightthickness=0, bg="#101820")
     logo.grid(row=0, column=0, sticky="ew")
     logo.bind("<Configure>", lambda _event: _draw_start_logo(logo))
 
@@ -1714,19 +1965,19 @@ def _run_start_menu_gui(root):
     mode_box = ttk.Combobox(
         calibration_panel,
         textvariable=calibration_mode,
-        values=("Automatic", "Manual DPI", "Use 1200 DPI"),
+        values=("Automatic", "Manual"),
         state="readonly",
-        width=14,
+        width=11,
     )
     mode_box.grid(row=0, column=1, sticky="w", padx=(0, 10), pady=(9, 4))
 
-    tk.Label(
+    dpi_label = tk.Label(
         calibration_panel,
         text="DPI",
         bg="#e8efeb",
         fg="#2c3d37",
         font=("Segoe UI", 9),
-    ).grid(row=0, column=2, sticky="e", padx=(0, 6), pady=(9, 4))
+    )
 
     dpi_box = tk.Spinbox(
         calibration_panel,
@@ -1736,39 +1987,20 @@ def _run_start_menu_gui(root):
         textvariable=calibration_dpi,
         width=7,
     )
-    dpi_box.grid(row=0, column=3, sticky="e", padx=(0, 10), pady=(9, 4))
 
-    tk.Label(
-        calibration_panel,
-        textvariable=calibration_text,
-        bg="#e8efeb",
-        fg="#52615c",
-        font=("Segoe UI", 9),
-        anchor="w",
-        wraplength=620,
-        justify="left",
-    ).grid(row=1, column=0, columnspan=4, sticky="ew", padx=10, pady=(0, 9))
-
-    def update_calibration_text(*_):
+    def update_calibration_controls(*_):
         mode = calibration_mode.get()
-        try:
-            dpi_value = float(calibration_dpi.get())
-        except (tk.TclError, ValueError):
-            dpi_value = PPI
-        if mode == "Automatic":
-            calibration_text.set(
-                f"Reads image DPI when reliable; otherwise uses {_format_dpi(dpi_value)} DPI and writes a warning."
-            )
-        elif mode == "Manual DPI":
-            calibration_text.set(f"Always measures area and length using {_format_dpi(dpi_value)} DPI.")
+        if mode == "Manual":
+            dpi_label.grid(row=0, column=2, sticky="e", padx=(0, 6), pady=(9, 9))
+            dpi_box.grid(row=0, column=3, sticky="e", padx=(0, 10), pady=(9, 9))
         else:
-            calibration_text.set(f"Always measures area and length using the SeedSizer default {_format_dpi(PPI)} DPI.")
+            dpi_label.grid_remove()
+            dpi_box.grid_remove()
 
     def current_calibration():
         mode_map = {
             "Automatic": "auto",
-            "Manual DPI": "manual",
-            "Use 1200 DPI": "fixed",
+            "Manual": "manual",
         }
         try:
             dpi_value = float(calibration_dpi.get())
@@ -1776,13 +2008,12 @@ def _run_start_menu_gui(root):
             dpi_value = PPI
         return {
             "mode": mode_map.get(calibration_mode.get(), "auto"),
-            "default_dpi": dpi_value if calibration_mode.get() == "Automatic" else PPI,
+            "default_dpi": PPI,
             "manual_dpi": dpi_value,
         }
 
-    calibration_mode.trace_add("write", update_calibration_text)
-    calibration_dpi.trace_add("write", update_calibration_text)
-    update_calibration_text()
+    calibration_mode.trace_add("write", update_calibration_controls)
+    update_calibration_controls()
 
     buttons = tk.Frame(panel, bg="#f4f7f5")
     buttons.grid(row=4, column=0, sticky="ew")
@@ -1792,19 +2023,33 @@ def _run_start_menu_gui(root):
         buttons,
         text="Start Scanning",
         style="Start.TButton",
-        command=lambda: _run_single_folder_gui(root, output_dir["path"], current_calibration()),
+        command=lambda: _run_single_folder_gui(
+            root,
+            output_dir["path"],
+            current_calibration(),
+            DEFAULT_CLUMP_MODE,
+        ),
     )
     queue_button = ttk.Button(
         buttons,
         text="Multi-Folder Queue",
         style="Start.TButton",
-        command=lambda: _run_folder_queue_gui(root, output_dir["path"], current_calibration()),
+        command=lambda: _run_folder_queue_gui(
+            root,
+            output_dir["path"],
+            current_calibration(),
+            DEFAULT_CLUMP_MODE,
+        ),
     )
     test_button = ttk.Button(
         buttons,
         text="Test SeedSizer",
         style="Start.TButton",
-        command=lambda: _run_test_seedsizer_gui(root, current_calibration()),
+        command=lambda: _run_test_seedsizer_gui(
+            root,
+            current_calibration(),
+            DEFAULT_CLUMP_MODE,
+        ),
     )
     exit_button = ttk.Button(
         buttons,
